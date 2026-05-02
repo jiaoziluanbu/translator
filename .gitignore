@@ -4,3 +4,11 @@ __pycache__/
 .DS_Store
 /tmp/
 *.log
+build/
+build.bak-*/
+build.old*/
+dist/
+dist.bak-*/
+dist.old*/
+swift/translator-helper
+swift/probe-prepare

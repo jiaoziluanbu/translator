@@ -1,0 +1,1194 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Local Translator — Editor</title>
+<style>
+  :root {
+    --sidebar-w: 320px;
+    --toolbar-h: 44px;
+    --bg: #1e1e1e;
+    --panel: #262626;
+    --border: #383838;
+    --text: #e6e6e6;
+    --muted: #9aa0a6;
+    --accent: #5eb0ff;
+  }
+  html, body { margin: 0; padding: 0; height: 100%; background: var(--bg); color: var(--text);
+    font: 13px/1.45 -apple-system, "PingFang SC", system-ui, sans-serif; }
+
+  /* Toolbar pinned at top. flex-wrap: wrap is a safety net — if the user
+     drags the window narrower than MIN_WIN_W can guarantee, the right
+     action group falls to a second row instead of being clipped. */
+  #toolbar { position: sticky; top: 0; z-index: 20; display: flex; align-items: center; gap: 6px;
+    min-height: var(--toolbar-h); padding: 4px 12px; background: #2a2a2a; border-bottom: 1px solid var(--border);
+    user-select: none; flex-wrap: wrap; }
+  #toolbar .group { display: flex; gap: 2px; align-items: center; flex-shrink: 0; }
+  #toolbar .sep { width: 1px; height: 22px; background: var(--border); margin: 0 4px; flex-shrink: 0; }
+  /* white-space: nowrap stops CJK button labels (撤销/保存带译文/etc) from
+     breaking each character onto its own line when the toolbar gets dense. */
+  #toolbar button { background: transparent; color: var(--text); border: 1px solid transparent;
+    border-radius: 6px; padding: 5px 10px; font-size: 13px; cursor: pointer; min-width: 30px;
+    white-space: nowrap; line-height: 1.2; transition: background 0.12s ease, border-color 0.12s ease; }
+  #toolbar button:hover { background: #333; }
+  #toolbar button:active { background: #2c2c2c; }
+  #toolbar button.active { background: #37506f; border-color: var(--accent); color: #fff; }
+  #toolbar button:disabled { opacity: 0.4; cursor: default; }
+  #toolbar label { color: var(--muted); font-size: 12px; margin-left: 4px; white-space: nowrap; }
+  #toolbar input[type=color] { width: 28px; height: 24px; padding: 0; border: 1px solid var(--border);
+    background: transparent; cursor: pointer; }
+  #toolbar input[type=range] { width: 70px; vertical-align: middle; }
+  #toolbar #stroke-preview, #toolbar #font-preview, #toolbar #mosaic-preview { width: 22px;
+    text-align: center; color: var(--muted); font-size: 12px; display: inline-block; }
+  /* Tool icons (square-ish) need a bigger glyph and consistent footprint. */
+  #toolbar button[data-tool] { font-size: 16px; line-height: 1; padding: 5px 8px; min-width: 32px; }
+  #toolbar .group.hidden { display: none; }
+
+  /* Crop overlay confirm bar */
+  #crop-bar { position: absolute; background: rgba(20,20,20,0.92); color: #fff;
+    border: 1px solid var(--accent); border-radius: 6px; padding: 4px 6px;
+    display: flex; gap: 4px; z-index: 40; font-size: 12px; }
+  #crop-bar button { background: #37506f; color: #fff; border: 1px solid var(--accent);
+    border-radius: 4px; padding: 3px 10px; cursor: pointer; font-size: 12px; }
+  #crop-bar button.cancel { background: transparent; border-color: #666; }
+
+  /* Single page-level scroll: left image + right column move together.
+     canvas-wrap flex-grows so the dark bg fills the extra horizontal space
+     when the window is wider than (stage + sidebar); stage is centered
+     inside it. This keeps the toolbar visible at a fixed minimum width
+     even for tiny screenshots. */
+  #root { display: flex; align-items: flex-start; min-height: calc(100vh - var(--toolbar-h)); }
+  #canvas-wrap { position: relative; background: #111; flex: 1 1 auto; min-width: 0;
+    display: flex; align-items: flex-start; justify-content: center; }
+  #stage { display: block; flex: 0 0 auto; }
+  #sidebar { width: var(--sidebar-w); background: var(--panel); border-left: 1px solid var(--border);
+    flex: 0 0 var(--sidebar-w); align-self: stretch; }
+  #sidebar-inner { position: relative; }
+  .para { position: absolute; left: 12px; right: 12px; background: #2f2f2f; border: 1px solid var(--border);
+    border-radius: 6px; padding: 6px 8px; box-sizing: border-box; }
+  .para .src { color: var(--muted); font-size: 11px; line-height: 1.4; margin-bottom: 4px; white-space: pre-wrap;
+    word-break: break-word; }
+  .para .tgt { color: var(--text); font-size: 13px; line-height: 1.45; white-space: pre-wrap; word-break: break-word; }
+  .para.empty { border-style: dashed; opacity: 0.5; }
+  #empty-hint { color: var(--muted); text-align: center; padding: 20px; font-size: 12px; }
+  #pending-hint { display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 12px; padding: 60px 20px; color: var(--muted); font-size: 12px; }
+  .spinner { width: 28px; height: 28px; border: 2px solid var(--border); border-top-color: var(--text);
+    border-radius: 50%; animation: spin 0.9s linear infinite; }
+  .spinner-text { font-size: 12px; color: var(--muted); }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #header { position: absolute; top: 8px; left: 8px; z-index: 10; background: rgba(0,0,0,0.6);
+    padding: 4px 10px; border-radius: 4px; font-size: 11px; color: var(--muted); pointer-events: none; }
+  #toast { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%);
+    background: rgba(0,0,0,0.82); color: #fff; padding: 8px 14px; border-radius: 6px;
+    font-size: 12px; opacity: 0; transition: opacity .2s; pointer-events: none; z-index: 50; }
+  #toast.show { opacity: 1; }
+
+  /* Inline text input (for text tool) */
+  #text-input { position: absolute; background: transparent; border: 1px dashed var(--accent);
+    color: inherit; outline: none; padding: 2px 4px; min-width: 60px; font-family: inherit;
+    z-index: 30; }
+</style>
+<!-- Konva path is rewritten to an absolute file:// URL by _write_wrapper_html
+     so the script loads from disk (no network roundtrip on cold start). -->
+<script src="vendor/konva.min.js"></script>
+</head>
+<body>
+<div id="toolbar">
+  <div class="group">
+    <button data-tool="select" title="选择 (V)">↖</button>
+    <button data-tool="rect"   title="矩形 (R)">▭</button>
+    <button data-tool="ellipse" title="椭圆 (C)">◯</button>
+    <button data-tool="line"   title="直线 (L)">／</button>
+    <button data-tool="arrow"  title="箭头 (A)">➝</button>
+    <button data-tool="pen"    title="画笔 (P)">✎</button>
+    <button data-tool="text"   title="文字 (T)">T</button>
+    <button data-tool="label"  title="标签 (N)">①</button>
+    <button data-tool="mosaic" title="马赛克 (M)">▦</button>
+    <button data-tool="blur"   title="模糊 (B)">◐</button>
+    <button data-tool="crop"   title="裁剪 (X)">⛶</button>
+  </div>
+  <div class="sep"></div>
+  <div class="group" id="grp-color">
+    <label>颜色</label>
+    <input type="color" id="stroke-color" value="#ff3b30">
+  </div>
+  <div class="group" id="grp-stroke">
+    <label>粗细</label>
+    <input type="range" id="stroke-width" min="1" max="16" value="3">
+    <span id="stroke-preview">3</span>
+  </div>
+  <div class="group" id="grp-font">
+    <label>字号</label>
+    <input type="range" id="font-size" min="10" max="48" value="18">
+    <span id="font-preview">18</span>
+  </div>
+  <div class="group hidden" id="grp-mosaic">
+    <label>块大小</label>
+    <input type="range" id="mosaic-size" min="4" max="40" value="12">
+    <span id="mosaic-preview">12</span>
+  </div>
+  <div class="sep"></div>
+  <div class="group">
+    <button id="btn-undo" title="撤销 (⌘Z)">撤销</button>
+    <button id="btn-delete" title="删除选中 (Delete)" disabled>删除</button>
+    <button id="btn-clear" title="清空标注">清空</button>
+  </div>
+  <div style="flex: 1"></div>
+  <div class="group">
+    <button id="btn-copy"       title="复制到剪贴板 (⌘C)">复制</button>
+    <button id="btn-save"       title="保存截图 (⌘S)">保存图</button>
+    <button id="btn-save-trans" title="保存图 + 译文 (⌘⇧S)">保存带译文</button>
+  </div>
+</div>
+<div id="root">
+  <div id="canvas-wrap">
+    <div id="header"></div>
+    <div id="stage"></div>
+  </div>
+  <div id="sidebar">
+    <div id="sidebar-inner"></div>
+  </div>
+</div>
+<div id="toast"></div>
+<script>
+(async function() {
+  const payload = window.__EDITOR_PAYLOAD__ || {
+    image_url: 'https://placehold.co/800x600/2a2a2a/888?text=demo+screenshot',
+    img_w: 800, img_h: 600, scale: 1.0,
+    src_lang: 'en', tgt_lang: 'zh',
+    aligned: [
+      { y_top: 40,  height: 40, src_text: 'Claude Status',           tgt_text: '克劳德状态' },
+      { y_top: 120, height: 60, src_text: 'SUBSCRIBE TO UPDATES',    tgt_text: '订阅更新' },
+      { y_top: 260, height: 80, src_text: 'Elevated connection reset errors', tgt_text: '连接重置错误增多' },
+      { y_top: 400, height: 120, src_text: 'Investigating — we are currently investigating this issue.', tgt_text: '调查中 — 我们正在调查这个问题。' },
+    ],
+  };
+  const { image_url, img_w, img_h, scale, aligned, src_lang, tgt_lang } = payload;
+
+  // --- Diagnostic logging bridge ---
+  // Pipes JS-side errors / render progress to /tmp/translator-editor.log via
+  // pywebview JS API. Buffers messages until the API is ready (it's not on
+  // synchronous startup) so nothing is dropped.
+  const __logBuf = [];
+  function jslog(msg) {
+    try { console.log('[editor]', msg); } catch (_) {}
+    if (window.pywebview && window.pywebview.api && window.pywebview.api.jslog) {
+      window.pywebview.api.jslog(String(msg));
+    } else {
+      __logBuf.push(String(msg));
+    }
+  }
+  function __flushLogBuf() {
+    if (!(window.pywebview && window.pywebview.api && window.pywebview.api.jslog)) return;
+    while (__logBuf.length) {
+      window.pywebview.api.jslog(__logBuf.shift());
+    }
+  }
+  window.addEventListener('pywebviewready', __flushLogBuf);
+  setTimeout(__flushLogBuf, 200);
+  setTimeout(__flushLogBuf, 1000);
+  window.addEventListener('error', (e) => {
+    jslog('JS ERROR: ' + (e && e.message) + ' @ ' + (e.filename || '?') + ':' + (e.lineno || '?') + ':' + (e.colno || '?'));
+  });
+  window.addEventListener('unhandledrejection', (e) => {
+    jslog('UNHANDLED PROMISE: ' + (e && e.reason));
+  });
+  jslog('boot: payload keys=' + Object.keys(payload).join(',') + ' img=' + img_w + 'x' + img_h + ' scale=' + scale + ' aligned=' + aligned.length);
+
+  document.getElementById('header').textContent =
+    `${src_lang} → ${tgt_lang}  ·  ${img_w}×${img_h}px  ·  ${aligned.length} 段`;
+
+  // Konva stage sized to scaled image. Use mutable refs so crop can resize.
+  const stageWRef = { v: Math.round(img_w * scale) };
+  const stageHRef = { v: Math.round(img_h * scale) };
+  const stage = new Konva.Stage({ container: 'stage', width: stageWRef.v, height: stageHRef.v });
+  const bgLayer = new Konva.Layer({ listening: false });
+  const annLayer = new Konva.Layer();
+  stage.add(bgLayer);
+  stage.add(annLayer);
+
+  jslog('stage created ' + stageWRef.v + 'x' + stageHRef.v + ' image_url=' + image_url);
+  const img = new Image();
+  img.onload = () => {
+    jslog('image onload: natural=' + img.naturalWidth + 'x' + img.naturalHeight);
+    const kImg = new Konva.Image({ image: img, x: 0, y: 0, width: stageWRef.v, height: stageHRef.v, listening: false });
+    bgLayer.add(kImg);
+    bgLayer.draw();
+  };
+  img.onerror = (ev) => {
+    jslog('image onerror: ' + image_url + ' err=' + (ev && ev.message));
+    document.getElementById('header').textContent = 'image load FAILED: ' + image_url;
+  };
+  img.src = image_url;
+
+  // Right sidebar: position each paragraph at y_top * scale.
+  const inner = document.getElementById('sidebar-inner');
+  const MIN_H = 36;
+  const GAP = 6;
+  inner.style.height = stageHRef.v + 'px';
+
+  // Mutable: starts as payload.aligned; replaced when pending result arrives.
+  // Other code (save, crop) reads from `aligned` so we keep the binding live.
+  let alignedRef = aligned;
+
+  function renderSidebar(items) {
+    inner.innerHTML = '';
+    jslog('rendering sidebar: aligned=' + items.length);
+    if (items.length === 0) {
+      inner.innerHTML = '<div id="empty-hint">未识别到文本</div>';
+      inner.style.height = stageHRef.v + 'px';
+      return;
+    }
+    const placed = items.map(p => {
+      const top = Math.round(p.y_top * scale);
+      const minH = Math.max(MIN_H, Math.round(p.height * scale));
+      const el = document.createElement('div');
+      el.className = 'para' + (p.tgt_text ? '' : ' empty');
+      el.style.top = top + 'px';
+      el.style.minHeight = minH + 'px';
+      const s = document.createElement('div'); s.className = 'src'; s.textContent = p.src_text;
+      const t = document.createElement('div'); t.className = 'tgt'; t.textContent = p.tgt_text || '(无译文)';
+      el.appendChild(s); el.appendChild(t);
+      inner.appendChild(el);
+      return { el, top };
+    });
+    requestAnimationFrame(() => {
+      let prevBottom = -Infinity;
+      let maxBottom = 0;
+      for (const item of placed) {
+        let top = item.top;
+        if (top < prevBottom + GAP) top = prevBottom + GAP;
+        item.el.style.top = top + 'px';
+        const h = item.el.offsetHeight;
+        prevBottom = top + h;
+        if (prevBottom > maxBottom) maxBottom = prevBottom;
+      }
+      inner.style.height = Math.max(maxBottom + 20, stageHRef.v) + 'px';
+    });
+  }
+
+  if (payload.pending) {
+    // Image-only mode: show a spinner and wait for Python to push the result
+    // via window.__onTranslationResult. One fallback fetch covers the race
+    // where the result lands before this script runs.
+    inner.innerHTML = '<div id="pending-hint"><div class="spinner"></div><div class="spinner-text">翻译中…</div></div>';
+    let resultApplied = false;
+
+    function applyResult(res) {
+      if (resultApplied) return;
+      resultApplied = true;
+      if (!res || res.ok === false) {
+        const err = (res && res.error) || '未知错误';
+        jslog('result: error: ' + err);
+        inner.innerHTML = '<div id="empty-hint">翻译失败：' + err + '</div>';
+        return;
+      }
+      jslog('result: aligned=' + (res.aligned ? res.aligned.length : 0));
+      alignedRef = res.aligned || [];
+      aligned.length = 0;
+      for (const a of alignedRef) aligned.push(a);
+      document.getElementById('header').textContent =
+        `${res.src_lang} → ${res.tgt_lang}  ·  ${img_w}×${img_h}px  ·  ${aligned.length} 段`;
+      renderSidebar(aligned);
+    }
+
+    // Push receiver — Python's watcher thread calls this via evaluate_js.
+    window.__onTranslationResult = applyResult;
+
+    // Fallback: once pywebview API is bound, ask once if the result already
+    // arrived before the receiver was registered. After that, push handles it.
+    let bindAttempts = 0;
+    const bindTimer = setInterval(async () => {
+      bindAttempts++;
+      if (resultApplied) { clearInterval(bindTimer); return; }
+      const api = window.pywebview && window.pywebview.api && window.pywebview.api.get_translation_result;
+      if (!api) {
+        if (bindAttempts > 40) { clearInterval(bindTimer); jslog('fallback: API unavailable'); }
+        return;
+      }
+      clearInterval(bindTimer);
+      try {
+        const res = await window.pywebview.api.get_translation_result();
+        if (res && !resultApplied) applyResult(res);
+      } catch (e) {
+        jslog('fallback: exception ' + e);
+      }
+    }, 100);
+  } else {
+    renderSidebar(aligned);
+  }
+
+  // ---------- Toolbar + drawing ----------
+  const state = {
+    tool: 'select',
+    color: '#ff3b30',
+    strokeW: 3,
+    fontSize: 18,
+    mosaicBlock: 12,
+    labelCounter: 0,
+  };
+  const undoStack = []; // array of Konva.Node
+  let selectedNode = null;
+  let cropState = null; // { box, guide, bar } while crop confirm bar is shown
+
+  // Transformer = selection frame + resize handles.
+  // resizeEnabled is toggled per-selection: on for shapes, off for Text
+  // (text is resized via the font-size slider instead).
+  const transformer = new Konva.Transformer({
+    rotateEnabled: false,
+    borderStroke: '#5eb0ff',
+    borderStrokeWidth: 1,
+    borderDash: [4, 4],
+    anchorStroke: '#5eb0ff',
+    anchorFill: '#ffffff',
+    anchorSize: 8,
+    ignoreStroke: true,
+  });
+  annLayer.add(transformer);
+
+  const isTransformerPart = (n) => {
+    let p = n;
+    while (p) {
+      if (p === transformer) return true;
+      p = p.getParent ? p.getParent() : null;
+    }
+    return false;
+  };
+  const isAnnotationShape = (n) =>
+    n && n !== transformer && !isTransformerPart(n)
+    && n.getLayer && n.getLayer() === annLayer;
+
+  const select = (node) => {
+    // If the click landed inside a label Group, select the Group (not its child).
+    if (node && node.getParent && node.getParent().name && node.getParent().name() === 'label') {
+      node = node.getParent();
+    }
+    selectedNode = isAnnotationShape(node) ? node : null;
+    if (selectedNode) {
+      const cls = selectedNode.getClassName();
+      const name = selectedNode.name ? selectedNode.name() : '';
+      const isText = cls === 'Text';
+      const isLabel = name === 'label';
+      const isPixel = name === 'mosaic' || name === 'blur';
+      // Text/label resize via font-size slider; others via corner handles.
+      transformer.resizeEnabled(!isText && !isLabel);
+      transformer.enabledAnchors(
+        (isText || isLabel) ? [] : ['top-left','top-right','bottom-left','bottom-right']
+      );
+      transformer.keepRatio(isLabel);
+      transformer.nodes([selectedNode]);
+      if (isLabel) {
+        const circle = selectedNode.findOne('.label-bg');
+        const tNode  = selectedNode.findOne('.label-text');
+        if (circle) colorInput.value = rgbToHex(circle.fill()) || colorInput.value;
+        if (tNode)  { fEl.value = tNode.fontSize(); fPrev.textContent = fEl.value; }
+      } else if (isText) {
+        colorInput.value = rgbToHex(selectedNode.fill()) || colorInput.value;
+        fEl.value = selectedNode.fontSize(); fPrev.textContent = fEl.value;
+      } else if (!isPixel) {
+        colorInput.value = rgbToHex(selectedNode.stroke()) || colorInput.value;
+        wEl.value = selectedNode.strokeWidth(); wPrev.textContent = wEl.value;
+      }
+    } else {
+      transformer.nodes([]);
+    }
+    const dBtn = document.getElementById('btn-delete');
+    if (dBtn) dBtn.disabled = !selectedNode;
+    annLayer.batchDraw();
+  };
+
+  const toolButtons = document.querySelectorAll('#toolbar button[data-tool]');
+  const grpColor = document.getElementById('grp-color');
+  const grpStroke = document.getElementById('grp-stroke');
+  const grpFont = document.getElementById('grp-font');
+  const grpMosaic = document.getElementById('grp-mosaic');
+
+  // Which param panels each tool cares about.
+  const TOOL_PANELS = {
+    select:  { color: true,  stroke: true,  font: true,  mosaic: false },
+    rect:    { color: true,  stroke: true,  font: false, mosaic: false },
+    ellipse: { color: true,  stroke: true,  font: false, mosaic: false },
+    line:    { color: true,  stroke: true,  font: false, mosaic: false },
+    arrow:   { color: true,  stroke: true,  font: false, mosaic: false },
+    pen:     { color: true,  stroke: true,  font: false, mosaic: false },
+    text:    { color: true,  stroke: false, font: true,  mosaic: false },
+    label:   { color: true,  stroke: false, font: true,  mosaic: false },
+    mosaic:  { color: false, stroke: false, font: false, mosaic: true  },
+    blur:    { color: false, stroke: false, font: false, mosaic: false },
+    crop:    { color: false, stroke: false, font: false, mosaic: false },
+  };
+  const applyPanels = (t) => {
+    const p = TOOL_PANELS[t] || TOOL_PANELS.select;
+    grpColor.classList.toggle('hidden',  !p.color);
+    grpStroke.classList.toggle('hidden', !p.stroke);
+    grpFont.classList.toggle('hidden',   !p.font);
+    grpMosaic.classList.toggle('hidden', !p.mosaic);
+  };
+
+  const setTool = (t) => {
+    state.tool = t;
+    toolButtons.forEach(b => b.classList.toggle('active', b.dataset.tool === t));
+    const cursor = t === 'select' ? 'default'
+      : (t === 'text' ? 'text'
+      : (t === 'label' ? 'copy' : 'crosshair'));
+    stage.container().style.cursor = cursor;
+    // Enable dragging only in select mode.
+    annLayer.getChildren(isAnnotationShape).forEach(n => n.draggable(t === 'select'));
+    if (t !== 'select') select(null);
+    cancelCrop();
+    applyPanels(t);
+  };
+  toolButtons.forEach(b => b.addEventListener('click', () => setTool(b.dataset.tool)));
+  setTool('select');
+
+  // Utility: normalise a CSS color string (e.g. "rgb(255,0,0)" or "#ff0000") to #rrggbb.
+  function rgbToHex(c) {
+    if (!c) return null;
+    if (c[0] === '#' && c.length === 7) return c.toLowerCase();
+    const m = String(c).match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+    if (!m) return null;
+    return '#' + [1,2,3].map(i => (+m[i]).toString(16).padStart(2,'0')).join('');
+  }
+
+  const colorInput = document.getElementById('stroke-color');
+  const wEl = document.getElementById('stroke-width'), wPrev = document.getElementById('stroke-preview');
+  const fEl = document.getElementById('font-size'), fPrev = document.getElementById('font-preview');
+
+  colorInput.addEventListener('input', e => {
+    state.color = e.target.value;
+    if (selectedNode) {
+      const cls = selectedNode.getClassName();
+      const nm = selectedNode.name ? selectedNode.name() : '';
+      if (nm === 'label') {
+        const circle = selectedNode.findOne('.label-bg');
+        if (circle) circle.fill(state.color);
+      } else if (cls === 'Text') {
+        selectedNode.fill(state.color);
+      } else if (nm === 'mosaic' || nm === 'blur') {
+        // no color for pixelated overlays
+      } else {
+        selectedNode.stroke(state.color);
+        if (cls === 'Arrow') selectedNode.fill(state.color);
+      }
+      annLayer.batchDraw();
+    }
+  });
+  wEl.addEventListener('input', e => {
+    state.strokeW = +e.target.value; wPrev.textContent = e.target.value;
+    if (selectedNode && selectedNode.getClassName() !== 'Text') {
+      selectedNode.strokeWidth(state.strokeW);
+      annLayer.batchDraw();
+    }
+  });
+  fEl.addEventListener('input', e => {
+    state.fontSize = +e.target.value; fPrev.textContent = e.target.value;
+    if (selectedNode && selectedNode.getClassName() === 'Text') {
+      selectedNode.fontSize(state.fontSize);
+      annLayer.batchDraw();
+    } else if (selectedNode && selectedNode.name() === 'label') {
+      updateLabelFontSize(selectedNode, state.fontSize);
+      annLayer.batchDraw();
+    }
+  });
+
+  const mEl = document.getElementById('mosaic-size');
+  const mPrev = document.getElementById('mosaic-preview');
+  mEl.addEventListener('input', e => {
+    state.mosaicBlock = +e.target.value; mPrev.textContent = e.target.value;
+  });
+
+  const pushShape = (node) => {
+    annLayer.add(node);
+    node.draggable(state.tool === 'select');
+    if (node.getClassName() === 'Text') {
+      node.on('dblclick dbltap', () => editTextNode(node));
+    }
+    undoStack.push(node);
+    transformer.moveToTop();
+    annLayer.batchDraw();
+  };
+  const undo = () => {
+    const n = undoStack.pop();
+    if (n) {
+      if (selectedNode === n) select(null);
+      n.destroy();
+      annLayer.batchDraw();
+    }
+  };
+  const deleteSelected = () => {
+    if (!selectedNode) return;
+    const n = selectedNode;
+    const i = undoStack.indexOf(n);
+    if (i >= 0) undoStack.splice(i, 1);
+    select(null);
+    n.destroy();
+    annLayer.batchDraw();
+  };
+  const clearAll = () => {
+    cancelCrop();
+    undoStack.length = 0;
+    selectedNode = null;
+    state.labelCounter = 0;
+    annLayer.destroyChildren();
+    // Re-attach transformer after wipe.
+    annLayer.add(transformer);
+    transformer.nodes([]);
+    annLayer.batchDraw();
+    const ti = document.getElementById('text-input');
+    if (ti) { ti.dataset.cancelled = '1'; ti.remove(); }
+  };
+  document.getElementById('btn-undo').addEventListener('click', undo);
+  document.getElementById('btn-clear').addEventListener('click', clearAll);
+  const delBtn = document.getElementById('btn-delete');
+  delBtn.addEventListener('click', deleteSelected);
+
+  // Keyboard shortcuts
+  window.addEventListener('keydown', (e) => {
+    if (document.activeElement && document.activeElement.id === 'text-input') return;
+    const meta = e.metaKey || e.ctrlKey;
+    if (meta && e.key.toLowerCase() === 'z') { e.preventDefault(); undo(); return; }
+    if ((e.key === 'Delete' || e.key === 'Backspace') && selectedNode) {
+      e.preventDefault(); deleteSelected(); return;
+    }
+    if (meta && e.key.toLowerCase() === 's') {
+      e.preventDefault();
+      if (e.shiftKey) doSaveWithTranslation(); else doSave();
+      return;
+    }
+    if (meta && e.key.toLowerCase() === 'c'
+        && !(document.activeElement && /input|textarea/i.test(document.activeElement.tagName))) {
+      e.preventDefault(); doCopyToClipboard(); return;
+    }
+    if (e.key === 'Escape') { cancelCrop(); setTool('select'); return; }
+    if (meta && e.key === 'Enter' && cropState) { e.preventDefault(); applyCrop(cropState.box); return; }
+    if (!meta && !e.altKey) {
+      const map = { v:'select', r:'rect', c:'ellipse', l:'line', a:'arrow', p:'pen', t:'text',
+                    n:'label', m:'mosaic', b:'blur', x:'crop' };
+      const t = map[e.key.toLowerCase()];
+      if (t) setTool(t);
+    }
+  });
+
+  // Drawing state
+  let drawing = null;
+
+  stage.on('mousedown touchstart', (e) => {
+    if (state.tool === 'select') {
+      const tgt = e.target;
+      // Transformer anchors / border: let Konva handle the transform, don't touch selection.
+      if (isTransformerPart(tgt)) return;
+      if (isAnnotationShape(tgt)) {
+        // Already selected → let Konva's native drag fire without resetting transformer.
+        if (tgt !== selectedNode) select(tgt);
+      } else {
+        select(null);
+      }
+      return;
+    }
+    if (state.tool === 'text') { beginText(stage.getPointerPosition()); return; }
+    if (state.tool === 'label') { addLabel(stage.getPointerPosition()); return; }
+    const p = stage.getPointerPosition();
+    if (!p) return;
+    if (state.tool === 'mosaic' || state.tool === 'blur' || state.tool === 'crop') {
+      drawing = { node: null, start: p, kind: state.tool, rect: makeGuideRect(p) };
+      return;
+    }
+    const common = { stroke: state.color, strokeWidth: state.strokeW, draggable: false,
+      lineCap: 'round', lineJoin: 'round', strokeScaleEnabled: false };
+    let node = null;
+    if (state.tool === 'rect') {
+      node = new Konva.Rect({ x: p.x, y: p.y, width: 0, height: 0, ...common });
+      node.hitFunc(function(ctx) {
+        ctx.beginPath(); ctx.rect(0, 0, this.width(), this.height()); ctx.closePath();
+        ctx.fillStrokeShape(this);
+      });
+    } else if (state.tool === 'ellipse') {
+      node = new Konva.Ellipse({ x: p.x, y: p.y, radiusX: 0, radiusY: 0, ...common });
+      node.hitFunc(function(ctx) {
+        ctx.beginPath();
+        ctx.ellipse(0, 0, Math.max(this.radiusX(), 0.1), Math.max(this.radiusY(), 0.1), 0, 0, 2 * Math.PI);
+        ctx.closePath();
+        ctx.fillStrokeShape(this);
+      });
+    } else if (state.tool === 'line') {
+      node = new Konva.Line({ points: [p.x, p.y, p.x, p.y], hitStrokeWidth: Math.max(12, state.strokeW + 8), ...common });
+    } else if (state.tool === 'arrow') {
+      node = new Konva.Arrow({ points: [p.x, p.y, p.x, p.y], fill: state.color,
+        hitStrokeWidth: Math.max(12, state.strokeW + 8),
+        pointerLength: Math.max(8, state.strokeW * 3), pointerWidth: Math.max(8, state.strokeW * 3), ...common });
+    } else if (state.tool === 'pen') {
+      node = new Konva.Line({ points: [p.x, p.y], tension: 0.5, bezier: true,
+        hitStrokeWidth: Math.max(12, state.strokeW + 8), ...common });
+    }
+    if (node) {
+      annLayer.add(node);
+      drawing = { node, start: p };
+    }
+  });
+
+  stage.on('mousemove touchmove', () => {
+    if (!drawing) return;
+    const p = stage.getPointerPosition();
+    if (!p) return;
+    const { node, start } = drawing;
+    const tool = state.tool;
+    if (drawing.kind === 'mosaic' || drawing.kind === 'blur' || drawing.kind === 'crop') {
+      const r = drawing.rect;
+      r.x(Math.min(start.x, p.x)); r.y(Math.min(start.y, p.y));
+      r.width(Math.abs(p.x - start.x)); r.height(Math.abs(p.y - start.y));
+      annLayer.batchDraw();
+      return;
+    }
+    if (tool === 'rect') {
+      node.x(Math.min(start.x, p.x)); node.y(Math.min(start.y, p.y));
+      node.width(Math.abs(p.x - start.x)); node.height(Math.abs(p.y - start.y));
+    } else if (tool === 'ellipse') {
+      const cx = (start.x + p.x) / 2, cy = (start.y + p.y) / 2;
+      node.x(cx); node.y(cy);
+      node.radiusX(Math.abs(p.x - start.x) / 2); node.radiusY(Math.abs(p.y - start.y) / 2);
+    } else if (tool === 'line' || tool === 'arrow') {
+      node.points([start.x, start.y, p.x, p.y]);
+    } else if (tool === 'pen') {
+      node.points(node.points().concat([p.x, p.y]));
+    }
+    annLayer.batchDraw();
+  });
+
+  stage.on('mouseup touchend', () => {
+    if (!drawing) return;
+    if (drawing.kind === 'mosaic' || drawing.kind === 'blur' || drawing.kind === 'crop') {
+      const r = drawing.rect;
+      const box = { x: r.x(), y: r.y(), w: r.width(), h: r.height() };
+      r.destroy();
+      drawing = null;
+      if (box.w < 4 || box.h < 4) { annLayer.batchDraw(); return; }
+      if (state.tool === 'mosaic') addPixelOverlay(box, 'mosaic');
+      else if (state.tool === 'blur') addPixelOverlay(box, 'blur');
+      else if (state.tool === 'crop') beginCropConfirm(box);
+      return;
+    }
+    const { node } = drawing;
+    // Discard zero-size shapes from accidental clicks.
+    const tool = state.tool;
+    let keep = true;
+    if (tool === 'rect' && (node.width() < 2 || node.height() < 2)) keep = false;
+    if (tool === 'ellipse' && (node.radiusX() < 1 || node.radiusY() < 1)) keep = false;
+    if ((tool === 'line' || tool === 'arrow')) {
+      const pts = node.points();
+      if (Math.hypot(pts[2] - pts[0], pts[3] - pts[1]) < 3) keep = false;
+    }
+    if (!keep) { node.destroy(); annLayer.batchDraw(); }
+    else { undoStack.push(node); }
+    drawing = null;
+  });
+
+  // ---------- Text tool (DOM input → Konva.Text) ----------
+  // In-place edit of an existing Konva.Text: hides the node, shows an input
+  // at its absolute position, writes back on commit.
+  function editTextNode(node) {
+    const existing = document.getElementById('text-input');
+    if (existing) existing.blur();
+
+    const container = stage.container();
+    const rect = container.getBoundingClientRect();
+    const absPos = node.getAbsolutePosition();
+    const input = document.createElement('input');
+    input.id = 'text-input';
+    input.type = 'text';
+    input.value = node.text();
+    input.style.left = (rect.left + window.scrollX + absPos.x) + 'px';
+    input.style.top  = (rect.top  + window.scrollY + absPos.y) + 'px';
+    input.style.color = node.fill();
+    input.style.fontSize = node.fontSize() + 'px';
+    input.style.minWidth = Math.max(60, node.width()) + 'px';
+    document.body.appendChild(input);
+
+    // Hide node while editing to avoid overlap with the DOM input.
+    node.visible(false);
+    transformer.nodes([]);
+    annLayer.batchDraw();
+
+    let committed = false;
+    let focusReady = false;
+    const commit = () => {
+      if (committed) return;
+      committed = true;
+      const cancelled = input.dataset.cancelled === '1';
+      const txt = input.value;
+      input.remove();
+      if (!cancelled && txt.trim()) node.text(txt);
+      node.visible(true);
+      select(node);
+    };
+    input.addEventListener('blur', () => { if (focusReady) commit(); });
+    input.addEventListener('keydown', (e) => {
+      e.stopPropagation();
+      if (e.key === 'Enter') { e.preventDefault(); commit(); }
+      else if (e.key === 'Escape') { input.dataset.cancelled = '1'; commit(); }
+    });
+    setTimeout(() => { input.focus(); input.select(); focusReady = true; }, 0);
+  }
+
+  function beginText(p) {
+    if (!p) return;
+    // If an input is already open, let it commit first.
+    const existing = document.getElementById('text-input');
+    if (existing) { existing.blur(); }
+
+    const container = stage.container();
+    const rect = container.getBoundingClientRect();
+    const input = document.createElement('input');
+    input.id = 'text-input';
+    input.type = 'text';
+    input.placeholder = '输入文字，回车确认';
+    input.style.left = (rect.left + window.scrollX + p.x) + 'px';
+    input.style.top  = (rect.top  + window.scrollY + p.y) + 'px';
+    input.style.color = state.color;
+    input.style.fontSize = state.fontSize + 'px';
+    document.body.appendChild(input);
+
+    let committed = false;
+    const commit = () => {
+      if (committed) return;
+      committed = true;
+      const cancelled = input.dataset.cancelled === '1';
+      const txt = input.value;
+      input.remove();
+      if (cancelled || !txt.trim()) return;
+      const node = new Konva.Text({
+        x: p.x, y: p.y, text: txt, fontSize: state.fontSize,
+        fontFamily: 'PingFang SC, -apple-system, sans-serif',
+        fill: state.color, draggable: false,
+      });
+      pushShape(node);
+      // Auto-switch to select so the user can immediately move/restyle it.
+      setTool('select');
+      select(node);
+    };
+
+    // Defer focus out of the current event so WKWebView reliably accepts it,
+    // and ignore any blur fired before focus has actually landed.
+    let focusReady = false;
+    input.addEventListener('blur', () => {
+      if (!focusReady) return;
+      commit();
+    });
+    input.addEventListener('keydown', (e) => {
+      e.stopPropagation(); // don't let global 'T'/'V' shortcuts steal keystrokes
+      if (e.key === 'Enter') { e.preventDefault(); commit(); }
+      else if (e.key === 'Escape') { input.dataset.cancelled = '1'; commit(); }
+    });
+    setTimeout(() => { input.focus(); focusReady = true; }, 0);
+  }
+
+  // ---------- Label tool (numbered badge) ----------
+  // A label = Konva.Group(Circle + Text). Group dragging moves both.
+  // Selecting a label shows the Transformer with 4 corner anchors scaling uniformly.
+  function addLabel(p) {
+    if (!p) return;
+    state.labelCounter += 1;
+    const text = String(state.labelCounter);
+    const fontSize = state.fontSize;
+    const radius = Math.max(fontSize * 0.9, 12);
+    const group = new Konva.Group({
+      x: p.x, y: p.y, name: 'label', draggable: false,
+    });
+    const circle = new Konva.Circle({
+      x: 0, y: 0, radius, fill: state.color,
+      stroke: '#ffffff', strokeWidth: 2, strokeScaleEnabled: false,
+      name: 'label-bg',
+    });
+    const label = new Konva.Text({
+      x: -radius, y: -fontSize / 2 - 1, width: radius * 2,
+      text, fontSize, fontStyle: 'bold',
+      fontFamily: 'PingFang SC, -apple-system, sans-serif',
+      fill: '#ffffff', align: 'center',
+      name: 'label-text', listening: false,
+    });
+    group.add(circle); group.add(label);
+    group.on('dblclick dbltap', () => editLabelNode(group));
+    pushShape(group);
+    setTool('select');
+    select(group);
+  }
+  function editLabelNode(group) {
+    const tNode = group.findOne('.label-text');
+    const container = stage.container();
+    const rect = container.getBoundingClientRect();
+    const abs = group.getAbsolutePosition();
+    const input = document.createElement('input');
+    input.id = 'text-input';
+    input.type = 'text';
+    input.value = tNode.text();
+    input.style.left = (rect.left + window.scrollX + abs.x - 40) + 'px';
+    input.style.top  = (rect.top  + window.scrollY + abs.y - tNode.fontSize()) + 'px';
+    input.style.color = '#fff';
+    input.style.fontSize = tNode.fontSize() + 'px';
+    input.style.textAlign = 'center';
+    input.style.minWidth = '60px';
+    document.body.appendChild(input);
+    let committed = false, focusReady = false;
+    const commit = () => {
+      if (committed) return; committed = true;
+      const cancelled = input.dataset.cancelled === '1';
+      const txt = input.value;
+      input.remove();
+      if (!cancelled && txt.trim()) {
+        tNode.text(txt);
+        relayoutLabel(group);
+      }
+      annLayer.batchDraw();
+    };
+    input.addEventListener('blur', () => { if (focusReady) commit(); });
+    input.addEventListener('keydown', (e) => {
+      e.stopPropagation();
+      if (e.key === 'Enter') { e.preventDefault(); commit(); }
+      else if (e.key === 'Escape') { input.dataset.cancelled = '1'; commit(); }
+    });
+    setTimeout(() => { input.focus(); input.select(); focusReady = true; }, 0);
+  }
+  function relayoutLabel(group) {
+    const tNode = group.findOne('.label-text');
+    const circle = group.findOne('.label-bg');
+    const fs = tNode.fontSize();
+    // Circle radius grows with text length (padding included).
+    const textW = Math.max(fs, tNode.text().length * fs * 0.62);
+    const radius = Math.max(fs * 0.9, textW / 2 + 6);
+    circle.radius(radius);
+    tNode.width(radius * 2);
+    tNode.x(-radius);
+    tNode.y(-fs / 2 - 1);
+  }
+  function updateLabelFontSize(group, fs) {
+    const tNode = group.findOne('.label-text');
+    tNode.fontSize(fs);
+    relayoutLabel(group);
+  }
+
+  // ---------- Mosaic / Blur overlay ----------
+  // Re-samples the background image (at natural resolution) into an offscreen
+  // canvas then either pixelates or blurs it; wraps the canvas in a Konva.Image
+  // sized to the selected stage-coord rect. Re-renders on drag/transform.
+  function renderPixelated(box, kind) {
+    const sx = Math.max(0, box.x / scale);
+    const sy = Math.max(0, box.y / scale);
+    const sw = Math.min(img.naturalWidth - sx, box.w / scale);
+    const sh = Math.min(img.naturalHeight - sy, box.h / scale);
+    if (sw <= 0 || sh <= 0) return null;
+    const c = document.createElement('canvas');
+    const outW = Math.max(4, Math.round(box.w));
+    const outH = Math.max(4, Math.round(box.h));
+    c.width = outW; c.height = outH;
+    const cctx = c.getContext('2d');
+    if (kind === 'mosaic') {
+      const block = Math.max(2, state.mosaicBlock);
+      const dsW = Math.max(1, Math.round(outW / block));
+      const dsH = Math.max(1, Math.round(outH / block));
+      const tmp = document.createElement('canvas');
+      tmp.width = dsW; tmp.height = dsH;
+      tmp.getContext('2d').drawImage(img, sx, sy, sw, sh, 0, 0, dsW, dsH);
+      cctx.imageSmoothingEnabled = false;
+      cctx.drawImage(tmp, 0, 0, dsW, dsH, 0, 0, outW, outH);
+    } else {
+      cctx.filter = 'blur(8px)';
+      cctx.drawImage(img, sx, sy, sw, sh, 0, 0, outW, outH);
+    }
+    return c;
+  }
+  function addPixelOverlay(box, kind) {
+    const c = renderPixelated(box, kind);
+    if (!c) return;
+    const node = new Konva.Image({
+      x: box.x, y: box.y, width: box.w, height: box.h, image: c,
+      name: kind, draggable: false,
+    });
+    // Re-render pixelation whenever the region changes (drag/resize).
+    const reRender = () => {
+      const newBox = { x: node.x(), y: node.y(),
+        w: node.width() * node.scaleX(), h: node.height() * node.scaleY() };
+      // Bake scale back into width/height so future resizes stay crisp.
+      node.width(newBox.w); node.height(newBox.h);
+      node.scaleX(1); node.scaleY(1);
+      const newC = renderPixelated(newBox, kind);
+      if (newC) node.image(newC);
+      annLayer.batchDraw();
+    };
+    node.on('transformend', reRender);
+    node.on('dragend', reRender);
+    pushShape(node);
+  }
+
+  // ---------- Crop tool ----------
+  // Strategy: after the user drags a rect, float a small confirm/cancel bar
+  // over it. On confirm: shift stage content by (-cropX,-cropY), resize stage
+  // to crop size, re-layout sidebar (drop paras fully outside crop y-range).
+  function makeGuideRect(p) {
+    const g = new Konva.Rect({
+      x: p.x, y: p.y, width: 0, height: 0,
+      stroke: '#5eb0ff', strokeWidth: 1, dash: [5, 4],
+      fill: 'rgba(94,176,255,0.08)', listening: false,
+      strokeScaleEnabled: false, name: 'crop-guide',
+    });
+    annLayer.add(g);
+    transformer.moveToTop();
+    return g;
+  }
+  function beginCropConfirm(box) {
+    cancelCrop();
+    const guide = new Konva.Rect({
+      x: box.x, y: box.y, width: box.w, height: box.h,
+      stroke: '#5eb0ff', strokeWidth: 1, dash: [5, 4],
+      fill: 'rgba(94,176,255,0.10)', listening: false,
+      strokeScaleEnabled: false, name: 'crop-guide-final',
+    });
+    annLayer.add(guide); annLayer.batchDraw();
+
+    const bar = document.createElement('div');
+    bar.id = 'crop-bar';
+    bar.innerHTML = '<button class="confirm">✓ 确定</button><button class="cancel">✕ 取消</button>';
+    const container = stage.container();
+    const rect = container.getBoundingClientRect();
+    bar.style.left = (rect.left + window.scrollX + box.x + box.w - 130) + 'px';
+    bar.style.top  = (rect.top  + window.scrollY + box.y + box.h + 8) + 'px';
+    document.body.appendChild(bar);
+    cropState = { box, guide, bar };
+    bar.querySelector('.confirm').addEventListener('click', () => applyCrop(box));
+    bar.querySelector('.cancel').addEventListener('click', () => { cancelCrop(); setTool('select'); });
+  }
+  function cancelCrop() {
+    if (!cropState) return;
+    try { cropState.guide.destroy(); } catch (_) {}
+    try { cropState.bar.remove(); } catch (_) {}
+    cropState = null;
+    annLayer.batchDraw();
+  }
+  function applyCrop(box) {
+    const cx = Math.round(box.x), cy = Math.round(box.y);
+    const cw = Math.round(box.w), ch = Math.round(box.h);
+    cancelCrop();
+
+    // 1) Resize stage + shift background image to align with crop origin.
+    stage.width(cw); stage.height(ch);
+    const kImg = bgLayer.findOne('Image');
+    if (kImg) { kImg.x(-cx); kImg.y(-cy); }
+    bgLayer.batchDraw();
+
+    // 2) Shift every annotation node; clip shapes outside is fine — stage masks draw.
+    annLayer.getChildren(isAnnotationShape).forEach(n => {
+      n.x(n.x() - cx); n.y(n.y() - cy);
+    });
+    annLayer.batchDraw();
+
+    // 3) Update payload so save() exports at correct pixel size.
+    payload.img_w = Math.round(cw / scale);
+    payload.img_h = Math.round(ch / scale);
+    // Mutate outer closure vars used by save.
+    stageWRef.v = cw; stageHRef.v = ch;
+
+    // 4) Trim sidebar paragraphs: drop those fully outside the crop y-range;
+    //    shift the rest up.
+    const paraEls = Array.from(inner.querySelectorAll('.para'));
+    paraEls.forEach(el => {
+      const top = el.offsetTop;
+      const h = el.offsetHeight;
+      const bottom = top + h;
+      if (bottom <= cy || top >= cy + ch) {
+        el.remove();
+      } else {
+        el.style.top = Math.max(0, top - cy) + 'px';
+      }
+    });
+    inner.style.height = ch + 'px';
+
+    document.getElementById('header').textContent =
+      `${src_lang} → ${tgt_lang}  ·  ${payload.img_w}×${payload.img_h}px  ·  裁剪后`;
+    setTool('select');
+    showToast('已裁剪');
+  }
+
+  // ---------- Save (composited PNG → Python) ----------
+  const toast = document.getElementById('toast');
+  const showToast = (msg) => {
+    toast.textContent = msg;
+    toast.classList.add('show');
+    setTimeout(() => toast.classList.remove('show'), 1600);
+  };
+
+  async function doSave() {
+    const btn = document.getElementById('btn-save');
+    btn.disabled = true;
+    try {
+      // toDataURL uses pixelRatio 1 of the scaled stage. For a v1 save we
+      // export at native resolution by boosting pixelRatio = 1/scale, so the
+      // file matches the original screenshot pixel size.
+      const pixelRatio = scale > 0 ? (1 / scale) : 1;
+      const dataUrl = stage.toDataURL({ mimeType: 'image/png', pixelRatio });
+      const b64 = dataUrl.split(',')[1];
+      if (window.pywebview && window.pywebview.api && window.pywebview.api.save_to_gallery) {
+        const res = await window.pywebview.api.save_to_gallery(b64, 'raw');
+        if (res && res.ok) showToast('已保存到画廊：' + res.name);
+        else showToast('保存失败：' + (res && res.error || '未知错误'));
+      } else {
+        // Fallback: trigger browser download (demo mode).
+        const a = document.createElement('a');
+        a.href = dataUrl;
+        a.download = 'local-translator.png';
+        a.click();
+        showToast('已触发下载（demo）');
+      }
+    } catch (err) {
+      showToast('保存失败：' + err.message);
+    } finally {
+      btn.disabled = false;
+    }
+  }
+  document.getElementById('btn-save').addEventListener('click', doSave);
+
+  // ---------- Copy to clipboard (image + annotations, no translation) ----------
+  async function doCopyToClipboard() {
+    const btn = document.getElementById('btn-copy');
+    btn.disabled = true;
+    try {
+      const pixelRatio = scale > 0 ? (1 / scale) : 1;
+      const dataUrl = stage.toDataURL({ mimeType: 'image/png', pixelRatio });
+      const b64 = dataUrl.split(',')[1];
+      if (window.pywebview && window.pywebview.api && window.pywebview.api.copy_png) {
+        const res = await window.pywebview.api.copy_png(b64);
+        if (res && res.ok) showToast('已复制到剪贴板');
+        else showToast('复制失败：' + (res && res.error || '未知错误'));
+      } else {
+        showToast('剪贴板 API 不可用（demo 模式）');
+      }
+    } catch (err) {
+      showToast('复制失败：' + err.message);
+    } finally {
+      btn.disabled = false;
+    }
+  }
+  document.getElementById('btn-copy').addEventListener('click', doCopyToClipboard);
+
+  // ---------- Save image + translation column as a single PNG ----------
+  function wrapText(ctx, text, maxW) {
+    const lines = [];
+    for (const para of String(text || '').split('\n')) {
+      let cur = '';
+      for (const ch of para) {
+        const test = cur + ch;
+        if (ctx.measureText(test).width > maxW && cur) {
+          lines.push(cur); cur = ch;
+        } else {
+          cur = test;
+        }
+      }
+      lines.push(cur);
+    }
+    return lines;
+  }
+  function roundRectPath(ctx, x, y, w, h, r) {
+    r = Math.min(r, w / 2, h / 2);
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.lineTo(x + w - r, y);     ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+    ctx.lineTo(x + w, y + h - r); ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+    ctx.lineTo(x + r, y + h);     ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+    ctx.lineTo(x, y + r);         ctx.quadraticCurveTo(x, y, x + r, y);
+    ctx.closePath();
+  }
+
+  async function doSaveWithTranslation() {
+    const btn = document.getElementById('btn-save-trans');
+    btn.disabled = true;
+    try {
+      const sidebarW = 320;
+      const innerEl = document.getElementById('sidebar-inner');
+      const stageW = stageWRef.v, stageH = stageHRef.v;
+      const totalW = stageW + sidebarW;
+      const totalH = Math.max(stageH, innerEl.offsetHeight || stageH);
+      const pixelRatio = scale > 0 ? (1 / scale) : 1;
+
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.round(totalW * pixelRatio);
+      canvas.height = Math.round(totalH * pixelRatio);
+      const ctx = canvas.getContext('2d');
+      ctx.scale(pixelRatio, pixelRatio);
+
+      // Left: stage (image + annotations).
+      ctx.fillStyle = '#111';
+      ctx.fillRect(0, 0, stageW, totalH);
+      const stageCanvas = stage.toCanvas({ pixelRatio: 1 });
+      ctx.drawImage(stageCanvas, 0, 0, stageW, stageH);
+
+      // Right: sidebar background + divider.
+      ctx.fillStyle = '#262626';
+      ctx.fillRect(stageW, 0, sidebarW, totalH);
+      ctx.fillStyle = '#383838';
+      ctx.fillRect(stageW, 0, 1, totalH);
+
+      const paraEls = innerEl.querySelectorAll('.para');
+      if (!paraEls.length) {
+        ctx.fillStyle = '#9aa0a6';
+        ctx.font = '12px -apple-system, "PingFang SC", sans-serif';
+        ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+        ctx.fillText('未识别到文本', stageW + sidebarW / 2, 24);
+      } else {
+        const panelX = stageW + 12;
+        const panelW = sidebarW - 24;
+        const innerPadX = 8, innerPadY = 6;
+        const srcFont = '11px -apple-system, "PingFang SC", sans-serif';
+        const tgtFont = '13px -apple-system, "PingFang SC", sans-serif';
+        const srcLH = 11 * 1.4, tgtLH = 13 * 1.45;
+
+        ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+
+        paraEls.forEach(el => {
+          const top = el.offsetTop;
+          const srcText = el.querySelector('.src').textContent;
+          const tgtText = el.querySelector('.tgt').textContent;
+
+          ctx.font = srcFont;
+          const srcLines = wrapText(ctx, srcText, panelW - innerPadX * 2);
+          ctx.font = tgtFont;
+          const tgtLines = wrapText(ctx, tgtText, panelW - innerPadX * 2);
+
+          const srcH = Math.max(srcLines.length, 1) * srcLH;
+          const tgtH = Math.max(tgtLines.length, 1) * tgtLH;
+          const panelH = innerPadY + srcH + 4 + tgtH + innerPadY;
+
+          roundRectPath(ctx, panelX, top, panelW, panelH, 6);
+          ctx.fillStyle = '#2f2f2f'; ctx.fill();
+          ctx.strokeStyle = '#383838'; ctx.lineWidth = 1; ctx.stroke();
+
+          ctx.fillStyle = '#9aa0a6'; ctx.font = srcFont;
+          srcLines.forEach((line, i) => ctx.fillText(line, panelX + innerPadX, top + innerPadY + i * srcLH));
+          ctx.fillStyle = '#e6e6e6'; ctx.font = tgtFont;
+          tgtLines.forEach((line, i) => ctx.fillText(line, panelX + innerPadX, top + innerPadY + srcH + 4 + i * tgtLH));
+        });
+      }
+
+      const dataUrl = canvas.toDataURL('image/png');
+      const b64 = dataUrl.split(',')[1];
+      if (window.pywebview && window.pywebview.api && window.pywebview.api.save_to_gallery) {
+        const res = await window.pywebview.api.save_to_gallery(b64, 'translated');
+        if (res && res.ok) showToast('已保存到画廊：' + res.name);
+        else showToast('保存失败：' + (res && res.error || '未知错误'));
+      } else {
+        const a = document.createElement('a');
+        a.href = dataUrl; a.download = 'local-translator-with-translation.png'; a.click();
+        showToast('已触发下载（demo）');
+      }
+    } catch (err) {
+      showToast('保存失败：' + err.message);
+    } finally {
+      btn.disabled = false;
+    }
+  }
+  document.getElementById('btn-save-trans').addEventListener('click', doSaveWithTranslation);
+
+  if (window.pywebview && window.pywebview.api && window.pywebview.api.ready) {
+    window.pywebview.api.ready({ stageW: stageWRef.v, stageH: stageHRef.v, paragraphs: aligned.length });
+  }
+})();
+</script>
+</body>
+</html>

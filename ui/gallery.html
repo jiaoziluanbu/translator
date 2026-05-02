@@ -1,0 +1,368 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>画廊 — Local Translator</title>
+<script src="https://unpkg.com/konva@9.3.6/konva.min.js"></script>
+<style>
+  :root {
+    --bg: #f4f1ec;
+    --grid: #e6e1d7;
+    --panel: #ffffff;
+    --text: #2a2a2a;
+    --muted: #8a8579;
+    --accent: #d97a4a;
+    --shadow: 0 6px 20px rgba(0,0,0,.10);
+  }
+  html, body {
+    margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font: 13px/1.5 -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif;
+    overflow: hidden;
+  }
+  #toolbar {
+    position: absolute; top: 0; left: 0; right: 0; height: 44px;
+    background: rgba(255,255,255,.85); backdrop-filter: blur(10px);
+    border-bottom: 1px solid #e0dccf;
+    display: flex; align-items: center; gap: 12px; padding: 0 16px; z-index: 10;
+  }
+  #toolbar .title { font-weight: 600; }
+  #toolbar .count { color: var(--muted); }
+  #toolbar .right { margin-left: auto; display: flex; gap: 8px; align-items: center; }
+  #toolbar button {
+    border: 1px solid #d8d3c4; background: #fff; color: var(--text);
+    padding: 5px 10px; border-radius: 6px; cursor: pointer; font-size: 12px;
+  }
+  #toolbar button:hover { background: #faf7f0; }
+  #stage-wrap { position: absolute; top: 44px; left: 0; right: 0; bottom: 0; }
+  #empty {
+    position: absolute; inset: 44px 0 0 0; display: none; align-items: center; justify-content: center;
+    color: var(--muted); pointer-events: none;
+  }
+  #empty.show { display: flex; }
+  /* Lightbox */
+  #lightbox {
+    position: fixed; inset: 0; background: rgba(0,0,0,.85); z-index: 100;
+    display: none; align-items: center; justify-content: center; cursor: zoom-out;
+  }
+  #lightbox.show { display: flex; }
+  #lightbox img { max-width: 92vw; max-height: 92vh; box-shadow: var(--shadow); }
+  /* Context menu */
+  #ctx {
+    position: absolute; background: #fff; border: 1px solid #ddd; border-radius: 6px;
+    box-shadow: var(--shadow); padding: 4px; min-width: 140px; display: none; z-index: 50;
+  }
+  #ctx.show { display: block; }
+  #ctx button {
+    display: block; width: 100%; text-align: left; border: 0; background: transparent;
+    padding: 6px 10px; cursor: pointer; font-size: 13px; border-radius: 4px;
+  }
+  #ctx button:hover { background: #f3f0e9; }
+  #ctx button.danger { color: #c0392b; }
+  #ctx button.danger:hover { background: #fdecea; }
+  #toast {
+    position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+    background: rgba(0,0,0,.78); color: #fff; padding: 8px 16px; border-radius: 18px;
+    font-size: 12px; opacity: 0; transition: opacity .2s; z-index: 200;
+  }
+  #toast.show { opacity: 1; }
+  #zoom-hint {
+    position: absolute; bottom: 12px; right: 12px; background: rgba(255,255,255,.85);
+    border: 1px solid #d8d3c4; border-radius: 4px; padding: 3px 8px; font-size: 11px;
+    color: var(--muted); pointer-events: none;
+  }
+</style>
+</head>
+<body>
+  <div id="toolbar">
+    <div class="title">📷 画廊</div>
+    <div class="count" id="count">0 张</div>
+    <div class="right">
+      <button id="btn-fit" title="居中所有内容">居中</button>
+      <button id="btn-reset" title="重置缩放到 100%">100%</button>
+    </div>
+  </div>
+  <div id="stage-wrap"></div>
+  <div id="empty">还没有画廊条目，去编辑器里点「保存图」或「保存带译文」试试。</div>
+  <div id="zoom-hint">滚轮缩放 · 空白拖拽平移 · 双击放大 · 右键菜单</div>
+  <div id="ctx">
+    <button data-act="open">查看大图</button>
+    <button data-act="rename">重命名</button>
+    <button data-act="delete" class="danger">删除</button>
+  </div>
+  <div id="lightbox"><img id="lightbox-img" alt=""></div>
+  <div id="toast"></div>
+
+<script>
+(function () {
+  const payload = window.__GALLERY_PAYLOAD__ || { items: [] };
+  let items = payload.items || [];
+
+  const wrap = document.getElementById('stage-wrap');
+  const stage = new Konva.Stage({
+    container: wrap,
+    width: wrap.clientWidth,
+    height: wrap.clientHeight,
+    draggable: true,
+  });
+
+  // Background grid layer (drawn via a single repeating pattern image).
+  const gridLayer = new Konva.Layer({ listening: false });
+  const cardLayer = new Konva.Layer();
+  stage.add(gridLayer);
+  stage.add(cardLayer);
+
+  function makeGridPattern() {
+    const c = document.createElement('canvas');
+    c.width = 40; c.height = 40;
+    const g = c.getContext('2d');
+    g.fillStyle = '#f4f1ec'; g.fillRect(0, 0, 40, 40);
+    g.fillStyle = '#e6e1d7'; g.fillRect(0, 0, 1, 1);
+    return c;
+  }
+  const gridImg = makeGridPattern();
+  const gridRect = new Konva.Rect({
+    x: -100000, y: -100000, width: 200000, height: 200000,
+    fillPatternImage: gridImg,
+    fillPatternRepeat: 'repeat',
+  });
+  gridLayer.add(gridRect);
+  gridLayer.draw();
+
+  // ---------- Card creation ----------
+  const CARD_PAD = 10;
+  const CARD_LABEL_H = 28;
+  const cardById = new Map();   // id -> Konva.Group
+
+  function clamp(v, a, b) { return Math.min(Math.max(v, a), b); }
+
+  function loadImage(url) {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = reject;
+      img.src = url;
+    });
+  }
+
+  async function makeCard(item, index) {
+    const img = await loadImage(item.thumb_url);
+    // Card sized to thumbnail's natural size (already <=400 on max edge).
+    const iw = img.width, ih = img.height;
+    const cw = iw + CARD_PAD * 2;
+    const ch = ih + CARD_PAD * 2 + CARD_LABEL_H;
+
+    // Initial position: stored or grid-fallback.
+    let x = item.canvas_x, y = item.canvas_y;
+    const isInitial = (x === 0 && y === 0);
+    if (isInitial) {
+      const COLS = 4;
+      const col = index % COLS;
+      const row = Math.floor(index / COLS);
+      x = 60 + col * 460;
+      y = 60 + row * 460;
+    }
+
+    const group = new Konva.Group({ x, y, draggable: true, name: 'card', id: item.id });
+
+    // Shadow + background
+    const bg = new Konva.Rect({
+      width: cw, height: ch, fill: '#ffffff', cornerRadius: 8,
+      shadowColor: 'black', shadowBlur: 12, shadowOpacity: 0.12, shadowOffsetY: 4,
+    });
+    const kImg = new Konva.Image({
+      x: CARD_PAD, y: CARD_PAD, image: img, width: iw, height: ih, cornerRadius: 4,
+    });
+    const kindBadge = new Konva.Label({ x: CARD_PAD + 4, y: CARD_PAD + 4, opacity: 0.9 });
+    kindBadge.add(new Konva.Tag({
+      fill: item.kind === 'translated' ? 'rgba(217,122,74,.92)' : 'rgba(40,40,40,.78)',
+      cornerRadius: 3,
+    }));
+    kindBadge.add(new Konva.Text({
+      text: item.kind === 'translated' ? '译图' : '原图',
+      padding: 4, fontSize: 11, fill: '#fff', fontFamily: 'PingFang SC, sans-serif',
+    }));
+    const labelText = new Konva.Text({
+      x: CARD_PAD, y: CARD_PAD + ih + 8,
+      text: item.name,
+      fontSize: 13, fill: '#2a2a2a', width: cw - CARD_PAD * 2,
+      ellipsis: true, wrap: 'none',
+      fontFamily: 'PingFang SC, -apple-system, sans-serif',
+    });
+    group.add(bg);
+    group.add(kImg);
+    group.add(kindBadge);
+    group.add(labelText);
+    group._item = item;
+    group._labelText = labelText;
+    cardLayer.add(group);
+    cardById.set(item.id, group);
+
+    // Drag — persist position on dragend.
+    group.on('dragend', () => {
+      item.canvas_x = group.x();
+      item.canvas_y = group.y();
+      if (window.pywebview && window.pywebview.api) {
+        window.pywebview.api.update_pos(item.id, group.x(), group.y());
+      }
+    });
+
+    // Double-click → lightbox.
+    group.on('dblclick dbltap', () => openLightbox(item));
+
+    // Right-click → context menu.
+    group.on('contextmenu', (e) => {
+      e.evt.preventDefault();
+      showContextMenu(e.evt.clientX, e.evt.clientY, item);
+    });
+
+    return group;
+  }
+
+  async function renderAll() {
+    cardLayer.destroyChildren();
+    cardById.clear();
+    for (let i = 0; i < items.length; i++) {
+      try { await makeCard(items[i], i); } catch (err) { console.warn('card load failed', err); }
+    }
+    cardLayer.draw();
+    document.getElementById('count').textContent = items.length + ' 张';
+    document.getElementById('empty').classList.toggle('show', items.length === 0);
+  }
+
+  // ---------- Pan + zoom ----------
+  // Stage-level dragging is enabled; but child cards drag individually too.
+  // Konva propagates: dragging a card consumes the event, so stage dragging
+  // only fires on empty space. That's exactly what we want.
+
+  const ZOOM_MIN = 0.2, ZOOM_MAX = 3;
+  function setZoom(newScale, anchor) {
+    newScale = clamp(newScale, ZOOM_MIN, ZOOM_MAX);
+    const oldScale = stage.scaleX();
+    const a = anchor || { x: stage.width() / 2, y: stage.height() / 2 };
+    const mp = { x: (a.x - stage.x()) / oldScale, y: (a.y - stage.y()) / oldScale };
+    stage.scale({ x: newScale, y: newScale });
+    stage.position({ x: a.x - mp.x * newScale, y: a.y - mp.y * newScale });
+    stage.batchDraw(); gridLayer.batchDraw();
+  }
+  wrap.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    const factor = e.deltaY < 0 ? 1.08 : 1 / 1.08;
+    setZoom(stage.scaleX() * factor, { x: e.offsetX, y: e.offsetY });
+  }, { passive: false });
+
+  window.addEventListener('resize', () => {
+    stage.width(wrap.clientWidth);
+    stage.height(wrap.clientHeight);
+    stage.batchDraw();
+  });
+
+  // ---------- Lightbox ----------
+  const lightbox = document.getElementById('lightbox');
+  const lightboxImg = document.getElementById('lightbox-img');
+  function openLightbox(item) {
+    lightboxImg.src = item.file_url;
+    lightbox.classList.add('show');
+  }
+  lightbox.addEventListener('click', () => lightbox.classList.remove('show'));
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') lightbox.classList.remove('show');
+  });
+
+  // ---------- Context menu ----------
+  const ctx = document.getElementById('ctx');
+  let ctxItem = null;
+  function showContextMenu(px, py, item) {
+    ctxItem = item;
+    ctx.style.left = px + 'px';
+    ctx.style.top = py + 'px';
+    ctx.classList.add('show');
+  }
+  function hideContextMenu() { ctx.classList.remove('show'); ctxItem = null; }
+  document.addEventListener('mousedown', (e) => {
+    if (!ctx.contains(e.target)) hideContextMenu();
+  });
+  ctx.addEventListener('click', async (e) => {
+    const act = e.target.dataset.act;
+    if (!act || !ctxItem) return;
+    const item = ctxItem;
+    hideContextMenu();
+    if (act === 'open') openLightbox(item);
+    else if (act === 'rename') doRename(item);
+    else if (act === 'delete') doDelete(item);
+  });
+
+  async function doRename(item) {
+    const name = prompt('重命名', item.name);
+    if (name == null) return;
+    const trimmed = name.trim();
+    if (!trimmed || trimmed === item.name) return;
+    if (window.pywebview && window.pywebview.api) {
+      const r = await window.pywebview.api.rename(item.id, trimmed);
+      if (r && r.ok) {
+        item.name = trimmed;
+        const card = cardById.get(item.id);
+        if (card) { card._labelText.text(trimmed); cardLayer.batchDraw(); }
+        showToast('已重命名');
+      } else {
+        showToast('重命名失败：' + (r && r.error || '未知错误'));
+      }
+    }
+  }
+  async function doDelete(item) {
+    if (!confirm(`确定删除「${item.name}」？此操作不可撤销。`)) return;
+    if (window.pywebview && window.pywebview.api) {
+      const r = await window.pywebview.api.delete(item.id);
+      if (r && r.ok) {
+        items = items.filter(x => x.id !== item.id);
+        const card = cardById.get(item.id);
+        if (card) { card.destroy(); cardById.delete(item.id); cardLayer.batchDraw(); }
+        document.getElementById('count').textContent = items.length + ' 张';
+        document.getElementById('empty').classList.toggle('show', items.length === 0);
+        showToast('已删除');
+      } else {
+        showToast('删除失败：' + (r && r.error || '未知错误'));
+      }
+    }
+  }
+
+  // ---------- Toast ----------
+  let toastTimer = null;
+  function showToast(msg) {
+    const t = document.getElementById('toast');
+    t.textContent = msg; t.classList.add('show');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => t.classList.remove('show'), 1800);
+  }
+
+  // ---------- Toolbar ----------
+  document.getElementById('btn-reset').addEventListener('click', () => {
+    stage.scale({ x: 1, y: 1 });
+    stage.position({ x: 0, y: 0 });
+    stage.batchDraw();
+  });
+  document.getElementById('btn-fit').addEventListener('click', () => {
+    if (cardById.size === 0) return;
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    cardById.forEach((g) => {
+      const r = g.getClientRect({ relativeTo: stage });
+      minX = Math.min(minX, r.x); minY = Math.min(minY, r.y);
+      maxX = Math.max(maxX, r.x + r.width); maxY = Math.max(maxY, r.y + r.height);
+    });
+    const padding = 60;
+    const bw = maxX - minX, bh = maxY - minY;
+    const sw = stage.width(), sh = stage.height();
+    const s = clamp(Math.min((sw - padding * 2) / bw, (sh - padding * 2) / bh), ZOOM_MIN, ZOOM_MAX);
+    stage.scale({ x: s, y: s });
+    stage.position({
+      x: (sw - bw * s) / 2 - minX * s,
+      y: (sh - bh * s) / 2 - minY * s,
+    });
+    stage.batchDraw(); gridLayer.batchDraw();
+  });
+
+  // ---------- Init ----------
+  renderAll();
+})();
+</script>
+</body>
+</html>

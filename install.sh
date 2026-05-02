@@ -39,7 +39,11 @@ python3 -m pip install --upgrade pip 2>/dev/null || pip3 install --upgrade pip 2
 # 安装依赖
 echo ""
 echo "[INFO] Installing pywebview and argostranslate..."
-pip3 install pywebview argostranslate rumps pynput pyobjc-framework-ApplicationServices 2>&1 | tail -5
+pip3 install pywebview argostranslate rumps pynput \
+    pyobjc-framework-ApplicationServices \
+    pyobjc-framework-Vision \
+    pyobjc-framework-Quartz \
+    pyobjc-framework-Cocoa 2>&1 | tail -5
 echo "[OK] Dependencies installed"
 
 # 下载语言包
