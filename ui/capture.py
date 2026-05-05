@@ -49,16 +49,6 @@ from AppKit import (
 )
 from Foundation import NSPoint, NSRect, NSSize, NSRunLoop, NSDate, NSDefaultRunLoopMode
 
-# Trace logger — dumps every step to /tmp so we can see where capture dies.
-def _trace(msg: str) -> None:
-    try:
-        import time as _t, os as _o
-        with open("/tmp/translator-capture-trace.log", "a", encoding="utf-8") as _f:
-            _f.write(f"[{_t.strftime('%H:%M:%S')}.{int(_t.time()*1000)%1000:03d}] pid={_o.getpid()} {msg}\n")
-            _f.flush()
-    except Exception:
-        pass
-
 
 @dataclass
 class CaptureResult:
@@ -163,11 +153,9 @@ class _OverlayView(NSView):
     # --- mouse handling ---
     def mouseDown_(self, evt):
         p = evt.locationInWindow()
-        _trace(f"mouseDown ({p.x:.0f},{p.y:.0f}) toolbar_visible={self.toolbar_visible}")
         # If toolbar is visible, route clicks first.
         hit = self._hit_button((p.x, p.y))
         if hit is not None:
-            _trace(f"  -> hit button: {hit}")
             if hit == "copy":
                 self.action = "copy"
                 self.done = True
@@ -197,7 +185,6 @@ class _OverlayView(NSView):
         self.setNeedsDisplay_(True)
 
     def mouseUp_(self, evt):
-        _trace(f"mouseUp dragging={self._dragging}")
         if not self._dragging:
             return
         p = evt.locationInWindow()
@@ -208,16 +195,12 @@ class _OverlayView(NSView):
             x2, y2 = self.cur_pt
             x, y = min(x1, x2), min(y1, y2)
             w, h = abs(x2 - x1), abs(y2 - y1)
-            _trace(f"  selection w={w:.0f} h={h:.0f}")
             if w >= 4 and h >= 4:
                 self.result_rect = (x, y, w, h)
                 try:
                     self.toolbar_rect, self.button_rects = self._compute_toolbar()
                     self.toolbar_visible = self.toolbar_rect is not None
-                    _trace(f"  toolbar_rect computed visible={self.toolbar_visible}")
-                except BaseException as e:
-                    import traceback
-                    _trace(f"  _compute_toolbar FAILED: {type(e).__name__}: {e}\n{traceback.format_exc()}")
+                except BaseException:
                     # Fall back to legacy behaviour: just finish with edit action.
                     self.action = "edit"
                     self.done = True
@@ -226,7 +209,6 @@ class _OverlayView(NSView):
                 # Bare click (no meaningful drag) → cancel the whole overlay.
                 # Matches the legacy v2.0 behaviour where any mouseUp closed
                 # the overlay (returning None when selection was tiny).
-                _trace("  drag < 4px → aborting overlay")
                 self.aborted = True
                 self.done = True
                 return
@@ -241,9 +223,7 @@ class _OverlayView(NSView):
     def drawRect_(self, rect):
         try:
             self._do_draw(rect)
-        except BaseException as e:
-            import traceback
-            _trace(f"drawRect FAILED: {type(e).__name__}: {e}\n{traceback.format_exc()}")
+        except BaseException:
             # Best-effort: still draw the dim background so the user sees something.
             try:
                 NSColor.colorWithCalibratedRed_green_blue_alpha_(0, 0, 0, 0.35).set()
@@ -303,7 +283,6 @@ class _OverlayView(NSView):
         s.drawAtPoint_withAttributes_(NSPoint(x + 6, y + 2), attrs)
 
     def _draw_toolbar(self):
-        _trace("_draw_toolbar entered")
         # Background pill
         NSColor.colorWithCalibratedRed_green_blue_alpha_(0.13, 0.13, 0.13, 0.92).set()
         path = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
@@ -343,7 +322,6 @@ class _OverlayView(NSView):
             ty = r.origin.y + (r.size.height - sh) / 2
             # Use positional 2-arg variant — keyword form is flaky under py2app.
             s.drawAtPoint_withAttributes_(NSPoint(tx, ty), attrs)
-        _trace("_draw_toolbar done")
 
 
 def _capture_cgimage_region(x: float, y: float, w: float, h: float):
@@ -423,12 +401,10 @@ def _cgimage_to_png_bytes(cg_image) -> bytes:
 
 def capture_region() -> Optional[CaptureResult]:
     """Show full-screen overlay and return captured region, or None if cancelled."""
-    _trace("capture_region: enter")
     app = NSApplication.sharedApplication()
     screen = NSScreen.mainScreen()
     frame = screen.frame()  # AppKit points
     backing_scale = screen.backingScaleFactor()
-    _trace(f"capture_region: frame={frame.size.width}x{frame.size.height} scale={backing_scale}")
 
     # Use a NonactivatingPanel so the overlay can receive mouse/key events
     # WITHOUT stealing focus from the foreground app. This preserves the
@@ -461,8 +437,6 @@ def capture_region() -> Optional[CaptureResult]:
     # NSApp.stop_() to break out also kills the outer rumps loop because
     # NSApp's stopped flag is process-wide. We pump events ourselves until
     # the overlay view sets `done = True`.
-    _trace("capture_region: entering event pump")
-    pump_iters = 0
     while not view.done:
         event = app.nextEventMatchingMask_untilDate_inMode_dequeue_(
             NSEventMaskAny,
@@ -472,18 +446,12 @@ def capture_region() -> Optional[CaptureResult]:
         )
         if event is not None:
             app.sendEvent_(event)
-        pump_iters += 1
-        if pump_iters % 200 == 0:
-            _trace(f"  event pump still alive iters={pump_iters} done={view.done}")
-    _trace(f"capture_region: event pump exited (iters={pump_iters}) action={view.action} aborted={view.aborted}")
 
     # Hide overlay before capturing so it doesn't appear in the screenshot.
     window.orderOut_(None)
 
     if view.aborted or view.result_rect is None:
-        _trace("capture_region: returning None (aborted or no result_rect)")
         return None
-    _trace(f"capture_region: action={view.action} rect={view.result_rect}")
 
     x_pt, y_pt, w_pt, h_pt = view.result_rect
     # CGDisplayCreateImageForRect takes display-space coords in points (top-left origin).
@@ -510,15 +478,11 @@ def capture_region() -> Optional[CaptureResult]:
         rl.runUntilDate_(NSDate.dateWithTimeIntervalSinceNow_(0.02))
 
     cg = _capture_cgimage_region(rect_x, rect_y, rect_w, rect_h)
-    _trace(f"capture_region: cgimage={'ok' if cg else 'NULL'}")
     if cg is None:
         return None
     try:
         png = _cgimage_to_png_bytes(cg)
-        _trace(f"capture_region: png ok size={len(png)}")
-    except BaseException as e:
-        import traceback
-        _trace(f"capture_region: PNG ENCODE FAILED: {type(e).__name__}: {e}\n{traceback.format_exc()}")
+    except BaseException:
         return None
     action = view.action or "edit"
     return CaptureResult(png_bytes=png, x=x_px, y=y_px, w=w_px, h=h_px, action=action)
