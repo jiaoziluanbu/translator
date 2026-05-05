@@ -65,10 +65,40 @@ CREATE TABLE IF NOT EXISTS gallery_items (
   canvas_x     REAL NOT NULL DEFAULT 0,
   canvas_y     REAL NOT NULL DEFAULT 0,
   canvas_scale REAL NOT NULL DEFAULT 1,
+  pinned       INTEGER NOT NULL DEFAULT 0,    -- 1 if user manually positioned
+  group_id     TEXT,                          -- nullable; FK to gallery_groups.id
   created_at   INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_gallery_created ON gallery_items(created_at DESC);
+CREATE TABLE IF NOT EXISTS gallery_groups (
+  id           TEXT PRIMARY KEY,
+  name         TEXT NOT NULL,
+  canvas_x     REAL NOT NULL DEFAULT 0,
+  canvas_y     REAL NOT NULL DEFAULT 0,
+  pinned       INTEGER NOT NULL DEFAULT 0,
+  created_at   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_groups_created ON gallery_groups(created_at DESC);
 """
+
+
+def _migrate_v2_1(c: sqlite3.Connection) -> None:
+    """Add pinned + group_id columns to gallery_items if missing.
+
+    Pre-v2.1 rows have canvas_x/y reflecting user drags (or 0,0 default).
+    Treat any row with non-zero coords as pinned=1 so existing manual
+    layouts survive the upgrade.
+    """
+    cols = {row[1] for row in c.execute("PRAGMA table_info(gallery_items)").fetchall()}
+    if "pinned" not in cols:
+        c.execute("ALTER TABLE gallery_items ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
+        c.execute(
+            "UPDATE gallery_items SET pinned=1 "
+            "WHERE canvas_x != 0 OR canvas_y != 0"
+        )
+    if "group_id" not in cols:
+        c.execute("ALTER TABLE gallery_items ADD COLUMN group_id TEXT")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_gallery_group ON gallery_items(group_id)")
 
 
 @dataclass
@@ -93,12 +123,15 @@ def _conn() -> sqlite3.Connection:
     GALLERY_THUMBS.mkdir(exist_ok=True)
     c = sqlite3.connect(DB_PATH)
     c.execute("PRAGMA foreign_keys = ON")
+    c.executescript(_SCHEMA)
+    _migrate_v2_1(c)
     return c
 
 
 def init_db() -> None:
     with _conn() as c:
         c.executescript(_SCHEMA)
+        _migrate_v2_1(c)
 
 
 def save_shot(orig_png: bytes, blocks: list, src: str, tgt: str,
@@ -174,6 +207,18 @@ class GalleryItem:
     canvas_y: float
     canvas_scale: float
     created_at: int
+    pinned: int = 0
+    group_id: str | None = None
+
+
+@dataclass
+class GalleryGroup:
+    id: str
+    name: str
+    canvas_x: float
+    canvas_y: float
+    pinned: int
+    created_at: int
 
 
 _THUMB_MAX = 400
@@ -218,38 +263,73 @@ def add_gallery_item(png_bytes: bytes, kind: str, *,
         name = f"{kind_cn}{lang} {ts}"
 
     with _conn() as c:
-        c.executescript(_SCHEMA)
         c.execute(
             "INSERT INTO gallery_items(id,name,kind,src_lang,tgt_lang,file_path,thumb_path,"
-            "width,height,canvas_x,canvas_y,canvas_scale,created_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,0,0,1,?)",
+            "width,height,canvas_x,canvas_y,canvas_scale,pinned,group_id,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,0,0,1,0,NULL,?)",
             (item_id, name, kind, src_lang, tgt_lang,
              str(file_path), str(thumb_path), width, height, now_ms),
         )
     return GalleryItem(item_id, name, kind, src_lang, tgt_lang,
                       str(file_path), str(thumb_path),
-                      width, height, 0.0, 0.0, 1.0, now_ms)
+                      width, height, 0.0, 0.0, 1.0, now_ms, 0, None)
 
 
 def list_gallery_items() -> list[GalleryItem]:
     with _conn() as c:
-        c.executescript(_SCHEMA)
         rows = c.execute(
             "SELECT id,name,kind,src_lang,tgt_lang,file_path,thumb_path,"
-            "width,height,canvas_x,canvas_y,canvas_scale,created_at "
+            "width,height,canvas_x,canvas_y,canvas_scale,created_at,pinned,group_id "
             "FROM gallery_items ORDER BY created_at DESC"
         ).fetchall()
     return [GalleryItem(*r) for r in rows]
 
 
-def update_gallery_pos(item_id: str, x: float, y: float, scale: float | None = None) -> None:
+def list_gallery_groups() -> list[GalleryGroup]:
     with _conn() as c:
-        if scale is None:
-            c.execute("UPDATE gallery_items SET canvas_x=?, canvas_y=? WHERE id=?",
-                      (x, y, item_id))
+        rows = c.execute(
+            "SELECT id,name,canvas_x,canvas_y,pinned,created_at "
+            "FROM gallery_groups ORDER BY created_at DESC"
+        ).fetchall()
+    return [GalleryGroup(*r) for r in rows]
+
+
+def update_gallery_pos(item_id: str, x: float, y: float, scale: float | None = None,
+                       pinned: bool | None = None) -> None:
+    """Update item position (and optionally scale, pinned flag).
+
+    The gallery now snaps to a grid, so any explicit position write should
+    also flip pinned=1 unless the caller passes pinned=False (only auto-
+    layout code path passes False)."""
+    with _conn() as c:
+        sets = ["canvas_x=?", "canvas_y=?"]
+        args: list = [x, y]
+        if scale is not None:
+            sets.append("canvas_scale=?")
+            args.append(scale)
+        if pinned is None:
+            sets.append("pinned=1")
         else:
-            c.execute("UPDATE gallery_items SET canvas_x=?, canvas_y=?, canvas_scale=? WHERE id=?",
-                      (x, y, scale, item_id))
+            sets.append("pinned=?")
+            args.append(1 if pinned else 0)
+        args.append(item_id)
+        c.execute(f"UPDATE gallery_items SET {','.join(sets)} WHERE id=?", args)
+
+
+def update_gallery_auto_pos(item_id: str, x: float, y: float) -> None:
+    """Position writeback for auto-layout flow — does NOT flip pinned."""
+    with _conn() as c:
+        c.execute(
+            "UPDATE gallery_items SET canvas_x=?, canvas_y=? "
+            "WHERE id=? AND pinned=0",
+            (x, y, item_id),
+        )
+
+
+def set_gallery_pinned(item_id: str, pinned: bool) -> None:
+    with _conn() as c:
+        c.execute("UPDATE gallery_items SET pinned=? WHERE id=?",
+                  (1 if pinned else 0, item_id))
 
 
 def rename_gallery_item(item_id: str, name: str) -> None:
@@ -268,6 +348,105 @@ def delete_gallery_item(item_id: str) -> None:
         ).fetchone()
         c.execute("DELETE FROM gallery_items WHERE id=?", (item_id,))
     if row:
+        for p in row:
+            if p:
+                try:
+                    Path(p).unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+
+# ---------- gallery groups ----------
+
+def create_gallery_group(item_ids: list[str], *, name: str | None = None,
+                        canvas_x: float = 0.0, canvas_y: float = 0.0,
+                        pinned: bool = False) -> str:
+    """Create a new group and assign all given items into it.
+
+    Returns the new group_id. Any prior group membership of these items
+    is replaced (each item belongs to at most one group)."""
+    if not item_ids:
+        raise ValueError("group must have at least 1 item")
+    group_id = uuid.uuid4().hex
+    now_ms = int(time.time() * 1000)
+    if not name:
+        name = f"分组 {time.strftime('%m-%d %H:%M', time.localtime(now_ms / 1000))}"
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO gallery_groups(id,name,canvas_x,canvas_y,pinned,created_at) "
+            "VALUES(?,?,?,?,?,?)",
+            (group_id, name, canvas_x, canvas_y, 1 if pinned else 0, now_ms),
+        )
+        for iid in item_ids:
+            c.execute(
+                "UPDATE gallery_items SET group_id=? WHERE id=?",
+                (group_id, iid),
+            )
+    return group_id
+
+
+def update_group_pos(group_id: str, x: float, y: float,
+                     pinned: bool | None = None) -> None:
+    with _conn() as c:
+        if pinned is None:
+            c.execute(
+                "UPDATE gallery_groups SET canvas_x=?, canvas_y=?, pinned=1 WHERE id=?",
+                (x, y, group_id),
+            )
+        else:
+            c.execute(
+                "UPDATE gallery_groups SET canvas_x=?, canvas_y=?, pinned=? WHERE id=?",
+                (x, y, 1 if pinned else 0, group_id),
+            )
+
+
+def update_group_auto_pos(group_id: str, x: float, y: float) -> None:
+    with _conn() as c:
+        c.execute(
+            "UPDATE gallery_groups SET canvas_x=?, canvas_y=? "
+            "WHERE id=? AND pinned=0",
+            (x, y, group_id),
+        )
+
+
+def rename_gallery_group(group_id: str, name: str) -> None:
+    name = (name or "").strip()
+    if not name:
+        return
+    with _conn() as c:
+        c.execute("UPDATE gallery_groups SET name=? WHERE id=?", (name, group_id))
+
+
+def add_to_group(item_id: str, group_id: str) -> None:
+    with _conn() as c:
+        c.execute("UPDATE gallery_items SET group_id=? WHERE id=?",
+                  (group_id, item_id))
+
+
+def remove_from_group(item_id: str) -> None:
+    """Move item back to ungrouped state."""
+    with _conn() as c:
+        c.execute("UPDATE gallery_items SET group_id=NULL WHERE id=?", (item_id,))
+
+
+def dissolve_group(group_id: str) -> None:
+    """Remove the group container; items return to ungrouped state."""
+    with _conn() as c:
+        c.execute("UPDATE gallery_items SET group_id=NULL WHERE group_id=?",
+                  (group_id,))
+        c.execute("DELETE FROM gallery_groups WHERE id=?", (group_id,))
+
+
+def delete_group_with_items(group_id: str) -> None:
+    """Delete the group and all its items (files included)."""
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT file_path, thumb_path FROM gallery_items WHERE group_id=?",
+            (group_id,),
+        ).fetchall()
+        c.execute("DELETE FROM gallery_items WHERE group_id=?", (group_id,))
+        c.execute("DELETE FROM gallery_groups WHERE id=?", (group_id,))
+    for row in rows:
         for p in row:
             if p:
                 try:

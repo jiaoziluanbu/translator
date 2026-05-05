@@ -175,6 +175,11 @@ class TranslatorDaemon(rumps.App):
         self._hot_ready = False
         self._hot_lock = threading.Lock()
         self._hot_respawn_inflight = False
+        # Anti-spam: ignore ⌃⌥A presses that arrive too soon after the
+        # previous trigger (overlay hasn't appeared yet → user thinks the
+        # hotkey didn't register and mashes it, then multiple overlays
+        # eventually stack on screen).
+        self._last_capture_trigger_at = 0.0
         # Load persisted prefs (currently: target_lang for ⌘⇧Y).
         self.prefs = _load_prefs()
         self.prefs.setdefault("target_lang", "auto")
@@ -245,6 +250,17 @@ class TranslatorDaemon(rumps.App):
         self._trigger_capture()
 
     def _trigger_capture(self):
+        # Anti-spam throttle. If the user mashes ⌃⌥A while a capture is
+        # still spinning up (cold fallback ~3-5s), accept only the first
+        # press and silently drop the rest. Otherwise multiple overlays
+        # stack on screen one after another and the user has to dismiss
+        # them all.
+        now = time.monotonic()
+        if now - self._last_capture_trigger_at < 0.8:
+            self._log_hot(f"capture throttled (delta={now - self._last_capture_trigger_at:.2f}s)")
+            return
+        self._last_capture_trigger_at = now
+
         used_hot = False
         with self._hot_lock:
             proc = self._hot_proc
@@ -799,6 +815,11 @@ def _run_worker():
         if cap is None:
             _log("capture cancelled or empty")
             os._exit(0)
+        if getattr(cap, "action", "edit") == "copy":
+            from ui.capture import copy_png_to_pasteboard
+            copy_png_to_pasteboard(cap.png_bytes)
+            _log(f"copied to pasteboard: {len(cap.png_bytes)} bytes")
+            os._exit(0)
         _run_pipeline_after_capture(cap, _log, capture_region, _ocr_mod, _tr, _layout)
     except BaseException as e:
         import traceback
@@ -862,6 +883,11 @@ def _run_hot_worker():
         cap = capture_region()
         if cap is None:
             _log("capture cancelled or empty")
+            os._exit(0)
+        if getattr(cap, "action", "edit") == "copy":
+            from ui.capture import copy_png_to_pasteboard
+            copy_png_to_pasteboard(cap.png_bytes)
+            _log(f"copied to pasteboard: {len(cap.png_bytes)} bytes")
             os._exit(0)
         _run_pipeline_after_capture(cap, _log, capture_region, _ocr_mod, _tr, _layout)
     except BaseException as e:

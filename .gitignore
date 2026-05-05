@@ -12,3 +12,4 @@ dist.bak-*/
 dist.old*/
 swift/translator-helper
 swift/probe-prepare
+scripts/probe/gallery_preview/

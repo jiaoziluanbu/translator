@@ -1,8 +1,6 @@
-"""Gallery window — Freeform-style infinite canvas of saved shots.
+"""Gallery window — Freeform-style canvas of saved shots.
 
-Loads `gallery.html` inside pywebview and exposes a JS API backed by
-`core.storage.gallery_*` for browsing, dragging, renaming, deleting,
-and double-click lightbox preview.
+v2.1: items + groups, 4-column snap grid, multi-select, drag-to-group.
 """
 from __future__ import annotations
 
@@ -38,6 +36,14 @@ def _items_payload() -> list[dict]:
     return out
 
 
+def _groups_payload() -> list[dict]:
+    return [asdict(g) for g in storage.list_gallery_groups()]
+
+
+def _full_payload() -> dict:
+    return {"items": _items_payload(), "groups": _groups_payload()}
+
+
 def _write_wrapper_html(payload: dict) -> Path:
     src = _GALLERY_HTML.read_text(encoding="utf-8")
     inject = f"<script>window.__GALLERY_PAYLOAD__ = {json.dumps(payload, ensure_ascii=False)};</script>"
@@ -48,10 +54,13 @@ def _write_wrapper_html(payload: dict) -> Path:
 
 
 class _GalleryApi:
-    def list(self) -> list[dict]:
-        return _items_payload()
+    # --- read ---
+    def list(self) -> dict:
+        return _full_payload()
 
-    def update_pos(self, item_id: str, x: float, y: float, scale: float | None = None) -> dict:
+    # --- item position / pin ---
+    def update_pos(self, item_id: str, x: float, y: float,
+                   scale: float | None = None) -> dict:
         try:
             storage.update_gallery_pos(item_id, float(x), float(y),
                                        None if scale is None else float(scale))
@@ -59,6 +68,29 @@ class _GalleryApi:
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
+    def update_auto_pos(self, item_id: str, x: float, y: float) -> dict:
+        try:
+            storage.update_gallery_auto_pos(item_id, float(x), float(y))
+            return {"ok": True}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    # --- group position / pin ---
+    def update_group_pos(self, group_id: str, x: float, y: float) -> dict:
+        try:
+            storage.update_group_pos(group_id, float(x), float(y))
+            return {"ok": True}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def update_group_auto_pos(self, group_id: str, x: float, y: float) -> dict:
+        try:
+            storage.update_group_auto_pos(group_id, float(x), float(y))
+            return {"ok": True}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    # --- rename / delete (item) ---
     def rename(self, item_id: str, name: str) -> dict:
         try:
             storage.rename_gallery_item(item_id, name)
@@ -73,6 +105,63 @@ class _GalleryApi:
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
+    def delete_many(self, item_ids: list[str]) -> dict:
+        try:
+            for iid in item_ids:
+                storage.delete_gallery_item(iid)
+            return {"ok": True}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    # --- group lifecycle ---
+    def create_group(self, item_ids: list[str], name: str | None = None,
+                     canvas_x: float = 0.0, canvas_y: float = 0.0,
+                     pinned: bool = False) -> dict:
+        try:
+            gid = storage.create_gallery_group(
+                list(item_ids), name=name,
+                canvas_x=float(canvas_x), canvas_y=float(canvas_y),
+                pinned=bool(pinned),
+            )
+            return {"ok": True, "group_id": gid}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def add_to_group(self, item_id: str, group_id: str) -> dict:
+        try:
+            storage.add_to_group(item_id, group_id)
+            return {"ok": True}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def remove_from_group(self, item_id: str) -> dict:
+        try:
+            storage.remove_from_group(item_id)
+            return {"ok": True}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def rename_group(self, group_id: str, name: str) -> dict:
+        try:
+            storage.rename_gallery_group(group_id, name)
+            return {"ok": True}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def dissolve_group(self, group_id: str) -> dict:
+        try:
+            storage.dissolve_group(group_id)
+            return {"ok": True}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def delete_group_with_items(self, group_id: str) -> dict:
+        try:
+            storage.delete_group_with_items(group_id)
+            return {"ok": True}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
 
 _window = None
 
@@ -80,7 +169,7 @@ _window = None
 def open_gallery(*, blocking: bool = True) -> None:
     """Open (or focus) the gallery window."""
     global _window
-    payload = {"items": _items_payload()}
+    payload = _full_payload()
     wrapper = _write_wrapper_html(payload)
     api = _GalleryApi()
     _window = webview.create_window(

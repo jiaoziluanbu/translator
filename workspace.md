@@ -1,6 +1,6 @@
 # Local Translator — 工作状态
 
-> 创建于 2026-04-23，最后更新于 2026-05-02（会话 10，v1.3.4：push 推送 + 多语言菜单）
+> 创建于 2026-04-23，最后更新于 2026-05-05（会话 11，v2.1.0：截图体验 + 画廊重构 + Service 修复）
 
 ## 流程 Checklist
 
@@ -13,10 +13,128 @@
 
 ## 当前状态
 
-- **阶段**：v1.3.3 已收尾，端到端延迟从 8-9s → 2s（4 倍提速）
-- **当前任务**：（可选）⌘⇧Y 选中翻译回归测试，需要用户实际选中文本验证
-- **进度**：daemon 瘦身 ✅、编码全修 ✅、6/6 段译文 ✅、Hot worker 池 ✅、Editor 早开 ✅、Konva 本地化 ✅、v1.3.3 dmg ✅、README ✅、部署 ✅
+- **阶段**：v2.1.0 已收尾，截图体验大改（不抢焦点 / 颜色还原 / 选区透明 / toolbar / 节流）+ 画廊网格化（卡片统一/吸附/多选/分组）+ 右键服务恢复
 - **阻塞项**：无
+- **下次方向（可选）**：第二次 ⌃⌥A 时若 hot worker 替补还没 ready，cold fallback ~3-5s。可扩池到 2 个进一步丝滑（成本 +400MB 内存）
+
+## 2026-05-05 会话 11：v2.1.0（截图体验 + 画廊重构 + Service 修复）
+
+### 1. 截图色彩还原（T1+T3 合并）
+
+之前 `_cgimage_to_png_bytes` 故意把 P3 → sRGB 抹掉 ICC profile（猜想 Konva canvas 不做 color management），结果 M 系内屏看起来发黄/灰。修法：
+
+- 改用 `kCGColorSpaceDisplayP3` 重画，PNG **嵌入 Display P3 ICC profile**
+- 同时去掉 alpha 通道（屏幕截图永远不透明，alpha 浪费 25% 像素数据）
+- ImageIO encode 设 `kCGImageDestinationLossyCompressionQuality=1.0`（zlib level 9）
+- 实测：相同区域 PNG 体积省 35-39%，颜色和系统 ⌘⇧4 完全一致
+
+文件：`ui/capture.py::_cgimage_to_png_bytes`
+
+### 2. 截图后浮层条（T2）
+
+拖框完后选区附近弹一条暗色 toolbar，三个按钮：📋 复制 / ✏️ 编辑 / ✕。
+- 复制 → PNG 进剪贴板（NSPasteboard public.png），不开编辑器
+- 编辑 → 走原流程
+- 取消 / drag<4px / ESC → 全部退出 overlay
+
+实现：
+- `_OverlayView` 加 toolbar 状态机（`toolbar_visible / button_rects / action`）
+- `_compute_toolbar()` 自动选位：默认选区下方 12px，下方空间不够翻到上方，再不够覆盖在选区底部内侧
+- `mouseDown_` 入口先 hit-test 工具条按钮，命中即设 action+done
+- `_draw_toolbar()` 绘背景圆角 + 三个按钮（cancel 红色调）
+- `mouseUp_` 里 `drag<4` 视为取消（恢复 v2.0 单击退出的行为，否则用户卡 overlay 里）
+- 加 `copy_png_to_pasteboard(bytes)` API；hot/cold worker 收到 `cap.action=='copy'` 时调它后 `os._exit(0)` 不开编辑器
+
+daemon 端 `_run_worker / _run_hot_worker` 都加了 copy 分支处理。
+
+### 3. 选区透明 + NonactivatingPanel 不抢焦点
+
+**选区透明**：`NSColor.clearColor() + fillRect_` 实际不会抠透明（默认 source-over），改用 `NSRectFillUsingOperation(sel, NSCompositingOperationClear)` 真正在 overlay 上抠洞，让选区显示真实屏幕颜色。
+
+**不抢焦点**：旧版 `NSWindow + makeKeyAndOrderFront_ + activateIgnoringOtherApps_(True)` 让 Local Translator 抢前台焦点 → Safari/Notes 等失焦 → 选中文字蓝色高亮变灰 → 截图记的是失焦后的颜色。修：
+
+- `NSWindow` → `NSPanel`，styleMask = `NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel`
+- 删 `app.activateIgnoringOtherApps_`
+- `makeKeyAndOrderFront_` → `orderFrontRegardless()`
+- 加 `setBecomesKeyOnlyIfNeeded_(True)` + `setHidesOnDeactivate_(False)`
+
+效果：overlay 还能接收 mouse/keyDown 事件，前台 app 保持 active，选中文字蓝色高亮被截图正确记录。
+
+### 4. 节流防 spam
+
+第一次按 ⌃⌥A 走 hot worker 瞬时；spawn 替补 hot worker 需 4-5s。如果替补还没 ready 时第二次按 → cold fallback（3-5s）。用户感觉"卡顿"，连按多次，最后多个 cold worker 一起跑，多个 overlay 叠出来。
+
+修：`_trigger_capture()` 入口加 0.8s 节流：
+```python
+now = time.monotonic()
+if now - self._last_capture_trigger_at < 0.8:
+    return
+self._last_capture_trigger_at = now
+```
+
+文件：`daemon.py::TranslatorDaemon._trigger_capture`
+
+### 5. 画廊：统一卡片 + 网格吸附 + 多选 + 分组（T4-T9）
+
+完整重写 `ui/gallery.html`（700 行）+ `ui/gallery_window.py` API 扩容 + `core/storage.py` schema 升级。
+
+**Schema 升级（带历史数据迁移）**：
+- `gallery_items` 加 `pinned INTEGER NOT NULL DEFAULT 0`、`group_id TEXT`
+- 新表 `gallery_groups (id, name, canvas_x, canvas_y, pinned, created_at)`
+- 迁移：旧条目 `canvas_x != 0 OR canvas_y != 0` 视为 `pinned=1`（保留用户手动拖过的位置）
+- 新增 API：`create_gallery_group / dissolve_group / delete_group_with_items / add_to_group / remove_from_group / rename_gallery_group / update_group_pos / update_group_auto_pos`，老 `update_gallery_pos` 加 `pinned` 参数
+
+**布局算法**：
+- 4 列 × N 行固定网格，CELL_W=224, CELL_H=248
+- pinned items + groups 占其 snap 后的 (col, row)
+- unpinned 按 `created_at DESC` 队列填空格（pinned 占的格子跳过）
+- 用户拖动 → snap 到最近格点 + 设 pinned=1
+- 「重新排列」工具按钮 → 不动 pinned，只重新铺 unpinned
+
+**多选**：
+- ⌘+点 切换、shift+点 范围选（按视觉 row-major 顺序）、空白拖框选
+- 顶部黑色选择条显示 "N 张已选"
+- ESC / 工具按钮 取消
+- Delete/Backspace 触发批量删除（带 confirm "确定删除 N 张？"）
+
+**分组**：
+- 主视图里 group 显示为 stacked card：3 层缩略图叠加（rotate ±2.5°）+ 数量徽章 + 📁 分组名
+- 创建：① 拖一张 ungrouped item 到另一张 item 上（自动建组）/ 拖到现有 group 上（加入组）；② 多选 ≥2 张 item → 选择条「创建分组」按钮
+- 详情视图：双击 group → 全屏 overlay div 网格铺开成员 + 重命名（双击标题）/ 解散 / 删除（含图）按钮
+- 解散 = 保留图，组内 items 回主视图按 created_at 重新流入网格
+- 删除 = 连图一起删（confirm 显示数量）
+
+**渲染优化**：固定卡片尺寸 200×220（不再随缩略图大小变），thumb `object-fit: contain` 居中，整体观感整齐。
+
+### 6. 右键服务 Translate 修复（历史遗留）
+
+`~/Library/Services/Translate.workflow` 不知何时丢了，重建踩两个坑：
+
+- **TCC 拦 Documents 路径**：workflow COMMAND_STRING 指向 `~/Documents/...` 报 `Operation not permitted`。Automator 的 sandbox 拦了。修：脚本搬到 `~/Library/Application Support/LocalTranslator/bin/translate-service.sh`
+- **路径含空格**：`~/Library/Application Support/...` 在 Run Shell Script 里被空格切开，报 `No such file: /Users/.../Library/Application`。修：在 `~/.local/bin/lt-translate.sh` 建无空格软链，workflow 指向软链
+
+`build_app.sh` 末尾加完整安装步骤，新装 dmg 后服务自动可用。
+
+### 7. 验证
+
+| 测试项 | 方式 | 结果 |
+|---|---|---|
+| Display P3 编码 | 合成 P3 红色图 → encode → PIL ICC | mode=RGB ✓ icc='Display P3' ✓ |
+| 历史数据迁移 | dev 模式 init_db | 18 张图迁移后 4 张 pinned（canvas≠0 的）✓ |
+| Group lifecycle | API smoke：create→add→remove→rename→dissolve | 全过 ✓ |
+| 画廊交互 | preview_eval 模拟：⌘点 / shift 范围 / 框选 / 创建分组 / 进分组 / 删多个 / 拖叠建组 / 拖入组 / ESC | 全过 ✓ |
+| 截图实测 | ⌃⌥A 端到端 | 颜色与系统一致 ✓、浮层条三按钮工作 ✓、复制进剪贴板 ✓、单击退出 ✓、选区透明 ✓、前台 app 保留焦点 ✓ |
+| 节流 | 连按 ⌃⌥A | 不再叠多个 overlay ✓ |
+| 右键服务 | Notes 选中文字 → 右键服务 → Translate | 弹原生对话框 + Copy 按钮 ✓ |
+
+### 8. 排查弯路（教训）
+
+1. **py2app 把 .py 编译成 .pyc 打进 `lib/python39.zip`**，import 时优先读 zip 内 .pyc。所以 hot-patch `Resources/ui/capture.py` 没生效——必须重 build。检查方法：`unzip -l <bundle>/Contents/Resources/lib/python39.zip | grep ui/capture.pyc`，看时间戳。
+2. 但 `Resources/` 顶层路径**先于** zip 在 `sys.path`，所以 `Resources/daemon.py / core/storage.py / ui/gallery_window.py / ui/gallery.html` 这些 cp 后能立即生效（zip 里没它们的 .pyc）。`ui/capture.py` 不幸被 py2app 收进 zip。
+3. py2app 重 build 引发 cdhash 改变 → TCC 辅助功能授权失效。每次重 build 后需要去「系统设置 → 隐私 → 辅助功能」重新勾选 Local Translator。
+4. PyObjC `s.drawAtPoint_(..., withAttributes_=...)` 关键字形式偶尔在 py2app bundle 里 flaky，统一用 `s.drawAtPoint_withAttributes_(point, attrs)` 双下划线位置形式更稳。
+
+---
 
 ## 2026-05-02 会话 10：v1.3.4（push + 多语言）
 

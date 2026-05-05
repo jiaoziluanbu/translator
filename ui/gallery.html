@@ -3,7 +3,6 @@
 <head>
 <meta charset="utf-8">
 <title>画廊 — Local Translator</title>
-<script src="https://unpkg.com/konva@9.3.6/konva.min.js"></script>
 <style>
   :root {
     --bg: #f4f1ec;
@@ -12,13 +11,17 @@
     --text: #2a2a2a;
     --muted: #8a8579;
     --accent: #d97a4a;
+    --select: #4a90e2;
+    --select-bg: rgba(74, 144, 226, 0.12);
     --shadow: 0 6px 20px rgba(0,0,0,.10);
+    --shadow-card: 0 2px 8px rgba(0,0,0,.08);
   }
   html, body {
     margin: 0; height: 100%; background: var(--bg); color: var(--text);
     font: 13px/1.5 -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif;
-    overflow: hidden;
+    overflow: hidden; user-select: none; -webkit-user-select: none;
   }
+  /* ---------- Toolbar ---------- */
   #toolbar {
     position: absolute; top: 0; left: 0; right: 0; height: 44px;
     background: rgba(255,255,255,.85); backdrop-filter: blur(10px);
@@ -33,23 +36,185 @@
     padding: 5px 10px; border-radius: 6px; cursor: pointer; font-size: 12px;
   }
   #toolbar button:hover { background: #faf7f0; }
-  #stage-wrap { position: absolute; top: 44px; left: 0; right: 0; bottom: 0; }
+  #toolbar button:disabled { opacity: 0.4; cursor: default; }
+  #toolbar button.danger { border-color: #e6b8b0; color: #c0392b; }
+  #toolbar button.danger:hover { background: #fdecea; }
+  #toolbar button.primary {
+    border-color: var(--accent); background: var(--accent); color: #fff;
+  }
+  #toolbar button.primary:hover { filter: brightness(1.05); }
+  /* ---------- Canvas ---------- */
+  #canvas-wrap {
+    position: absolute; top: 44px; left: 0; right: 0; bottom: 0;
+    overflow: auto; background: var(--bg);
+    background-image:
+      radial-gradient(circle, var(--grid) 1px, transparent 1px);
+    background-size: 20px 20px;
+  }
+  #canvas {
+    position: relative;
+    width: 100%; min-height: calc(100% - 1px);
+    padding: 24px; box-sizing: border-box;
+  }
   #empty {
     position: absolute; inset: 44px 0 0 0; display: none; align-items: center; justify-content: center;
     color: var(--muted); pointer-events: none;
   }
   #empty.show { display: flex; }
-  /* Lightbox */
+  /* ---------- Cards ---------- */
+  .card {
+    position: absolute; width: 200px; height: 220px;
+    background: var(--panel); border-radius: 10px;
+    box-shadow: var(--shadow-card);
+    overflow: hidden; cursor: grab;
+    transition: box-shadow .12s, transform .12s;
+    box-sizing: border-box; border: 2px solid transparent;
+  }
+  .card:hover { box-shadow: var(--shadow); }
+  .card.dragging { cursor: grabbing; opacity: 0.85; transform: scale(1.02); z-index: 50;
+                   transition: none; }
+  .card.selected { border-color: var(--select); box-shadow: 0 0 0 3px var(--select-bg), var(--shadow); }
+  .card.drop-target { box-shadow: 0 0 0 3px var(--accent), var(--shadow); }
+  .card .thumb-wrap {
+    width: 100%; height: 170px;
+    display: flex; align-items: center; justify-content: center;
+    background: #f8f5ee; overflow: hidden;
+  }
+  .card .thumb-wrap img {
+    max-width: 100%; max-height: 100%;
+    object-fit: contain;
+    pointer-events: none; user-drag: none; -webkit-user-drag: none;
+  }
+  .card .label {
+    position: absolute; bottom: 0; left: 0; right: 0;
+    padding: 8px 10px; height: 50px; box-sizing: border-box;
+    border-top: 1px solid #f0ece2;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    font-size: 12px;
+  }
+  .card .badge {
+    position: absolute; top: 6px; left: 6px;
+    font-size: 10px; padding: 2px 6px; border-radius: 3px;
+    color: #fff; line-height: 1.4;
+  }
+  .card .badge.raw { background: rgba(40,40,40,.78); }
+  .card .badge.translated { background: rgba(217,122,74,.92); }
+  /* ---------- Group cards (stack effect) ---------- */
+  .group-card {
+    position: absolute; width: 200px; height: 220px;
+    cursor: grab; box-sizing: border-box;
+  }
+  .group-card.dragging { cursor: grabbing; opacity: 0.85; z-index: 50; transition: none; }
+  .group-card.selected .group-front { border: 2px solid var(--select); }
+  .group-card .stack-layer {
+    position: absolute; background: var(--panel); border-radius: 10px;
+    box-shadow: var(--shadow-card); overflow: hidden;
+  }
+  /* Bottom layer offset down-right, middle slightly less, front exact */
+  .group-card .stack-back {
+    inset: 8px -6px -6px 8px; opacity: 0.85;
+    transform: rotate(2.5deg); transform-origin: top left;
+  }
+  .group-card .stack-mid {
+    inset: 4px -3px -3px 4px; opacity: 0.92;
+    transform: rotate(-1.5deg); transform-origin: top left;
+  }
+  .group-card .group-front {
+    position: absolute; inset: 0;
+    background: var(--panel); border-radius: 10px;
+    box-shadow: var(--shadow-card);
+    overflow: hidden; box-sizing: border-box; border: 2px solid transparent;
+  }
+  .group-card:hover .group-front { box-shadow: var(--shadow); }
+  .group-card .stack-layer img {
+    width: 100%; height: 170px; object-fit: contain;
+    background: #f8f5ee; pointer-events: none;
+  }
+  .group-card .group-name {
+    position: absolute; bottom: 0; left: 0; right: 0;
+    padding: 8px 10px; height: 50px; box-sizing: border-box;
+    border-top: 1px solid #f0ece2;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    font-size: 12px; font-weight: 600;
+  }
+  .group-card .group-count {
+    position: absolute; top: 6px; right: 6px;
+    background: rgba(40,40,40,.78); color: #fff;
+    font-size: 10px; padding: 2px 7px; border-radius: 10px; line-height: 1.4;
+  }
+  /* ---------- Marquee selection box ---------- */
+  #marquee {
+    position: absolute; border: 1px dashed var(--select);
+    background: var(--select-bg); pointer-events: none;
+    display: none; z-index: 20;
+  }
+  /* ---------- Lightbox / detail-view ---------- */
   #lightbox {
     position: fixed; inset: 0; background: rgba(0,0,0,.85); z-index: 100;
     display: none; align-items: center; justify-content: center; cursor: zoom-out;
   }
   #lightbox.show { display: flex; }
   #lightbox img { max-width: 92vw; max-height: 92vh; box-shadow: var(--shadow); }
-  /* Context menu */
+
+  #group-detail {
+    position: fixed; inset: 0; background: var(--bg); z-index: 80;
+    display: none; flex-direction: column;
+  }
+  #group-detail.show { display: flex; }
+  #group-detail-toolbar {
+    height: 56px; background: rgba(255,255,255,.92); backdrop-filter: blur(10px);
+    border-bottom: 1px solid #e0dccf;
+    display: flex; align-items: center; gap: 12px; padding: 0 16px;
+  }
+  #group-detail-toolbar h2 {
+    margin: 0; font-size: 16px; font-weight: 600;
+    cursor: text; padding: 4px 8px; border-radius: 4px;
+  }
+  #group-detail-toolbar h2:hover { background: #f5f1e7; }
+  #group-detail-toolbar .right { margin-left: auto; display: flex; gap: 8px; }
+  #group-detail-toolbar button {
+    border: 1px solid #d8d3c4; background: #fff;
+    padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 12px;
+  }
+  #group-detail-toolbar button:hover { background: #faf7f0; }
+  #group-detail-toolbar button.danger { border-color: #e6b8b0; color: #c0392b; }
+  #group-detail-toolbar button.danger:hover { background: #fdecea; }
+  #group-detail-grid {
+    flex: 1; overflow: auto; padding: 24px;
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+    gap: 20px; align-content: start;
+  }
+  #group-detail-grid .detail-card {
+    height: 240px; background: var(--panel); border-radius: 10px;
+    box-shadow: var(--shadow-card); overflow: hidden; cursor: pointer;
+    border: 2px solid transparent; box-sizing: border-box;
+    display: flex; flex-direction: column;
+    position: relative;
+  }
+  #group-detail-grid .detail-card:hover { box-shadow: var(--shadow); }
+  #group-detail-grid .detail-card.selected { border-color: var(--select); }
+  #group-detail-grid .detail-card .thumb-wrap {
+    flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center;
+    background: #f8f5ee; overflow: hidden;
+  }
+  #group-detail-grid .detail-card .thumb-wrap img {
+    max-width: 100%; max-height: 100%; object-fit: contain; pointer-events: none;
+  }
+  #group-detail-grid .detail-card .label {
+    padding: 8px 10px; height: 50px; box-sizing: border-box;
+    border-top: 1px solid #f0ece2;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px;
+  }
+  #group-detail-grid .detail-card .badge {
+    position: absolute; top: 6px; left: 6px;
+    font-size: 10px; padding: 2px 6px; border-radius: 3px; color: #fff;
+  }
+  #group-detail-grid .detail-card .badge.raw { background: rgba(40,40,40,.78); }
+  #group-detail-grid .detail-card .badge.translated { background: rgba(217,122,74,.92); }
+  /* ---------- Context menu ---------- */
   #ctx {
     position: absolute; background: #fff; border: 1px solid #ddd; border-radius: 6px;
-    box-shadow: var(--shadow); padding: 4px; min-width: 140px; display: none; z-index: 50;
+    box-shadow: var(--shadow); padding: 4px; min-width: 160px; display: none; z-index: 200;
   }
   #ctx.show { display: block; }
   #ctx button {
@@ -59,17 +224,30 @@
   #ctx button:hover { background: #f3f0e9; }
   #ctx button.danger { color: #c0392b; }
   #ctx button.danger:hover { background: #fdecea; }
+  #ctx hr { border: 0; border-top: 1px solid #eee; margin: 4px 0; }
+  /* ---------- Toast ---------- */
   #toast {
     position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
     background: rgba(0,0,0,.78); color: #fff; padding: 8px 16px; border-radius: 18px;
-    font-size: 12px; opacity: 0; transition: opacity .2s; z-index: 200;
+    font-size: 12px; opacity: 0; transition: opacity .2s; z-index: 300;
+    pointer-events: none;
   }
   #toast.show { opacity: 1; }
-  #zoom-hint {
-    position: absolute; bottom: 12px; right: 12px; background: rgba(255,255,255,.85);
-    border: 1px solid #d8d3c4; border-radius: 4px; padding: 3px 8px; font-size: 11px;
-    color: var(--muted); pointer-events: none;
+  /* ---------- Selection counter ---------- */
+  #selection-bar {
+    position: absolute; top: 8px; left: 50%; transform: translateX(-50%);
+    background: rgba(40,40,40,.92); color: #fff;
+    padding: 6px 14px; border-radius: 18px; font-size: 12px;
+    display: none; z-index: 30; gap: 8px; align-items: center;
   }
+  #selection-bar.show { display: flex; }
+  #selection-bar button {
+    background: rgba(255,255,255,.18); color: #fff; border: 0; padding: 3px 10px;
+    border-radius: 10px; font-size: 11px; cursor: pointer;
+  }
+  #selection-bar button:hover { background: rgba(255,255,255,.28); }
+  #selection-bar button.danger { background: rgba(220, 50, 50, .35); }
+  #selection-bar button.danger:hover { background: rgba(220, 50, 50, .55); }
 </style>
 </head>
 <body>
@@ -77,291 +255,863 @@
     <div class="title">📷 画廊</div>
     <div class="count" id="count">0 张</div>
     <div class="right">
-      <button id="btn-fit" title="居中所有内容">居中</button>
-      <button id="btn-reset" title="重置缩放到 100%">100%</button>
+      <button id="btn-relayout" title="按时间重新排列未固定的图">重新排列</button>
     </div>
   </div>
-  <div id="stage-wrap"></div>
+  <div id="canvas-wrap">
+    <div id="canvas"></div>
+  </div>
   <div id="empty">还没有画廊条目，去编辑器里点「保存图」或「保存带译文」试试。</div>
-  <div id="zoom-hint">滚轮缩放 · 空白拖拽平移 · 双击放大 · 右键菜单</div>
+  <div id="marquee"></div>
+  <div id="selection-bar">
+    <span id="selection-count">0 张已选</span>
+    <button id="btn-group">创建分组</button>
+    <button id="btn-clear">取消</button>
+    <button id="btn-delete-many" class="danger">删除</button>
+  </div>
+
   <div id="ctx">
-    <button data-act="open">查看大图</button>
-    <button data-act="rename">重命名</button>
-    <button data-act="delete" class="danger">删除</button>
+    <div id="ctx-body"></div>
   </div>
   <div id="lightbox"><img id="lightbox-img" alt=""></div>
+
+  <div id="group-detail">
+    <div id="group-detail-toolbar">
+      <button id="btn-group-back">← 返回</button>
+      <h2 id="group-detail-name" title="双击重命名">分组</h2>
+      <span class="count" id="group-detail-count" style="color: var(--muted);">0 张</span>
+      <div class="right">
+        <button id="btn-group-dissolve">解散分组</button>
+        <button id="btn-group-delete" class="danger">删除（含图）</button>
+      </div>
+    </div>
+    <div id="group-detail-grid"></div>
+  </div>
+
   <div id="toast"></div>
 
 <script>
 (function () {
-  const payload = window.__GALLERY_PAYLOAD__ || { items: [] };
-  let items = payload.items || [];
+  // ===================== Layout constants =====================
+  const COLS = 4;
+  const CARD_W = 200, CARD_H = 220;
+  const GAP_X = 24, GAP_Y = 28;
+  const CELL_W = CARD_W + GAP_X, CELL_H = CARD_H + GAP_Y;
+  const PADDING = 24;
 
-  const wrap = document.getElementById('stage-wrap');
-  const stage = new Konva.Stage({
-    container: wrap,
-    width: wrap.clientWidth,
-    height: wrap.clientHeight,
-    draggable: true,
-  });
+  // ===================== State =====================
+  const payload = window.__GALLERY_PAYLOAD__ || { items: [], groups: [] };
+  let allItems = payload.items || [];   // every item (incl. group members)
+  let allGroups = payload.groups || []; // every group container
+  const itemsById = new Map();
+  const groupsById = new Map();
+  for (const it of allItems) itemsById.set(it.id, it);
+  for (const g of allGroups) groupsById.set(g.id, g);
 
-  // Background grid layer (drawn via a single repeating pattern image).
-  const gridLayer = new Konva.Layer({ listening: false });
-  const cardLayer = new Konva.Layer();
-  stage.add(gridLayer);
-  stage.add(cardLayer);
+  const selection = new Set();          // entity ids: "item:<id>" or "group:<id>"
+  let lastSelectedKey = null;           // for shift-range select
 
-  function makeGridPattern() {
-    const c = document.createElement('canvas');
-    c.width = 40; c.height = 40;
-    const g = c.getContext('2d');
-    g.fillStyle = '#f4f1ec'; g.fillRect(0, 0, 40, 40);
-    g.fillStyle = '#e6e1d7'; g.fillRect(0, 0, 1, 1);
-    return c;
-  }
-  const gridImg = makeGridPattern();
-  const gridRect = new Konva.Rect({
-    x: -100000, y: -100000, width: 200000, height: 200000,
-    fillPatternImage: gridImg,
-    fillPatternRepeat: 'repeat',
-  });
-  gridLayer.add(gridRect);
-  gridLayer.draw();
-
-  // ---------- Card creation ----------
-  const CARD_PAD = 10;
-  const CARD_LABEL_H = 28;
-  const cardById = new Map();   // id -> Konva.Group
-
-  function clamp(v, a, b) { return Math.min(Math.max(v, a), b); }
-
-  function loadImage(url) {
-    return new Promise((resolve, reject) => {
-      const img = new Image();
-      img.onload = () => resolve(img);
-      img.onerror = reject;
-      img.src = url;
-    });
-  }
-
-  async function makeCard(item, index) {
-    const img = await loadImage(item.thumb_url);
-    // Card sized to thumbnail's natural size (already <=400 on max edge).
-    const iw = img.width, ih = img.height;
-    const cw = iw + CARD_PAD * 2;
-    const ch = ih + CARD_PAD * 2 + CARD_LABEL_H;
-
-    // Initial position: stored or grid-fallback.
-    let x = item.canvas_x, y = item.canvas_y;
-    const isInitial = (x === 0 && y === 0);
-    if (isInitial) {
-      const COLS = 4;
-      const col = index % COLS;
-      const row = Math.floor(index / COLS);
-      x = 60 + col * 460;
-      y = 60 + row * 460;
-    }
-
-    const group = new Konva.Group({ x, y, draggable: true, name: 'card', id: item.id });
-
-    // Shadow + background
-    const bg = new Konva.Rect({
-      width: cw, height: ch, fill: '#ffffff', cornerRadius: 8,
-      shadowColor: 'black', shadowBlur: 12, shadowOpacity: 0.12, shadowOffsetY: 4,
-    });
-    const kImg = new Konva.Image({
-      x: CARD_PAD, y: CARD_PAD, image: img, width: iw, height: ih, cornerRadius: 4,
-    });
-    const kindBadge = new Konva.Label({ x: CARD_PAD + 4, y: CARD_PAD + 4, opacity: 0.9 });
-    kindBadge.add(new Konva.Tag({
-      fill: item.kind === 'translated' ? 'rgba(217,122,74,.92)' : 'rgba(40,40,40,.78)',
-      cornerRadius: 3,
-    }));
-    kindBadge.add(new Konva.Text({
-      text: item.kind === 'translated' ? '译图' : '原图',
-      padding: 4, fontSize: 11, fill: '#fff', fontFamily: 'PingFang SC, sans-serif',
-    }));
-    const labelText = new Konva.Text({
-      x: CARD_PAD, y: CARD_PAD + ih + 8,
-      text: item.name,
-      fontSize: 13, fill: '#2a2a2a', width: cw - CARD_PAD * 2,
-      ellipsis: true, wrap: 'none',
-      fontFamily: 'PingFang SC, -apple-system, sans-serif',
-    });
-    group.add(bg);
-    group.add(kImg);
-    group.add(kindBadge);
-    group.add(labelText);
-    group._item = item;
-    group._labelText = labelText;
-    cardLayer.add(group);
-    cardById.set(item.id, group);
-
-    // Drag — persist position on dragend.
-    group.on('dragend', () => {
-      item.canvas_x = group.x();
-      item.canvas_y = group.y();
-      if (window.pywebview && window.pywebview.api) {
-        window.pywebview.api.update_pos(item.id, group.x(), group.y());
-      }
-    });
-
-    // Double-click → lightbox.
-    group.on('dblclick dbltap', () => openLightbox(item));
-
-    // Right-click → context menu.
-    group.on('contextmenu', (e) => {
-      e.evt.preventDefault();
-      showContextMenu(e.evt.clientX, e.evt.clientY, item);
-    });
-
-    return group;
-  }
-
-  async function renderAll() {
-    cardLayer.destroyChildren();
-    cardById.clear();
-    for (let i = 0; i < items.length; i++) {
-      try { await makeCard(items[i], i); } catch (err) { console.warn('card load failed', err); }
-    }
-    cardLayer.draw();
-    document.getElementById('count').textContent = items.length + ' 张';
-    document.getElementById('empty').classList.toggle('show', items.length === 0);
-  }
-
-  // ---------- Pan + zoom ----------
-  // Stage-level dragging is enabled; but child cards drag individually too.
-  // Konva propagates: dragging a card consumes the event, so stage dragging
-  // only fires on empty space. That's exactly what we want.
-
-  const ZOOM_MIN = 0.2, ZOOM_MAX = 3;
-  function setZoom(newScale, anchor) {
-    newScale = clamp(newScale, ZOOM_MIN, ZOOM_MAX);
-    const oldScale = stage.scaleX();
-    const a = anchor || { x: stage.width() / 2, y: stage.height() / 2 };
-    const mp = { x: (a.x - stage.x()) / oldScale, y: (a.y - stage.y()) / oldScale };
-    stage.scale({ x: newScale, y: newScale });
-    stage.position({ x: a.x - mp.x * newScale, y: a.y - mp.y * newScale });
-    stage.batchDraw(); gridLayer.batchDraw();
-  }
-  wrap.addEventListener('wheel', (e) => {
-    e.preventDefault();
-    const factor = e.deltaY < 0 ? 1.08 : 1 / 1.08;
-    setZoom(stage.scaleX() * factor, { x: e.offsetX, y: e.offsetY });
-  }, { passive: false });
-
-  window.addEventListener('resize', () => {
-    stage.width(wrap.clientWidth);
-    stage.height(wrap.clientHeight);
-    stage.batchDraw();
-  });
-
-  // ---------- Lightbox ----------
+  // ===================== DOM refs =====================
+  const canvas = document.getElementById('canvas');
+  const canvasWrap = document.getElementById('canvas-wrap');
+  const marquee = document.getElementById('marquee');
+  const ctx = document.getElementById('ctx');
+  const ctxBody = document.getElementById('ctx-body');
   const lightbox = document.getElementById('lightbox');
   const lightboxImg = document.getElementById('lightbox-img');
+  const groupDetail = document.getElementById('group-detail');
+  const groupDetailGrid = document.getElementById('group-detail-grid');
+  const groupDetailName = document.getElementById('group-detail-name');
+  const groupDetailCount = document.getElementById('group-detail-count');
+  const selBar = document.getElementById('selection-bar');
+  const selCount = document.getElementById('selection-count');
+
+  // ===================== Helpers =====================
+  function api() { return (window.pywebview && window.pywebview.api) || null; }
+  function showToast(msg) {
+    const t = document.getElementById('toast');
+    t.textContent = msg; t.classList.add('show');
+    clearTimeout(showToast._tm);
+    showToast._tm = setTimeout(() => t.classList.remove('show'), 1800);
+  }
+  function clamp(v, a, b) { return Math.min(Math.max(v, a), b); }
+  function snap(v, cell) { return Math.round(v / cell) * cell; }
+
+  function topVisibleEntities() {
+    // Items shown on main canvas: those without a group_id, plus all groups.
+    const items = allItems.filter(it => !it.group_id);
+    return { items, groups: allGroups.slice() };
+  }
+
+  function entityKey(kind, id) { return `${kind}:${id}`; }
+  function parseKey(k) { const i = k.indexOf(':'); return [k.slice(0, i), k.slice(i + 1)]; }
+
+  // ===================== Layout (auto-place unpinned) =====================
+  function computeLayout() {
+    // Two passes:
+    //   1. pinned entities occupy their snapped (col, row) cell -> mark cell taken.
+    //   2. unpinned entities placed by created_at DESC, row-major, into first
+    //      free cell.
+    const { items, groups } = topVisibleEntities();
+    const all = [
+      ...items.map(it => ({ kind: 'item', id: it.id, ent: it })),
+      ...groups.map(g => ({ kind: 'group', id: g.id, ent: g })),
+    ];
+    // Sort by created_at DESC (newest first → smallest cell index)
+    all.sort((a, b) => b.ent.created_at - a.ent.created_at);
+
+    const taken = new Set();        // "col,row" -> taken
+    const positions = new Map();    // key -> {col, row}
+
+    // Pass 1: pinned
+    for (const e of all) {
+      if (e.ent.pinned) {
+        const col = clamp(Math.round(e.ent.canvas_x / CELL_W), 0, COLS - 1);
+        const row = Math.max(0, Math.round(e.ent.canvas_y / CELL_H));
+        taken.add(`${col},${row}`);
+        positions.set(entityKey(e.kind, e.id), { col, row });
+      }
+    }
+    // Pass 2: unpinned
+    let nextIdx = 0;
+    function nextFreeCell() {
+      while (true) {
+        const col = nextIdx % COLS;
+        const row = Math.floor(nextIdx / COLS);
+        nextIdx += 1;
+        if (!taken.has(`${col},${row}`)) {
+          taken.add(`${col},${row}`);
+          return { col, row };
+        }
+      }
+    }
+    for (const e of all) {
+      if (!e.ent.pinned) {
+        const cell = nextFreeCell();
+        positions.set(entityKey(e.kind, e.id), cell);
+      }
+    }
+    return positions;
+  }
+
+  function cellToXY(col, row) {
+    return { x: PADDING + col * CELL_W, y: PADDING + row * CELL_H };
+  }
+  function xyToCell(x, y) {
+    return {
+      col: clamp(Math.round((x - PADDING) / CELL_W), 0, COLS - 1),
+      row: Math.max(0, Math.round((y - PADDING) / CELL_H)),
+    };
+  }
+
+  // ===================== Rendering =====================
+  function renderAll() {
+    canvas.innerHTML = '';
+    const positions = computeLayout();
+    const { items, groups } = topVisibleEntities();
+
+    let maxRow = 0;
+    for (const it of items) {
+      const k = entityKey('item', it.id);
+      const { col, row } = positions.get(k) || { col: 0, row: 0 };
+      maxRow = Math.max(maxRow, row);
+      const xy = cellToXY(col, row);
+      const card = makeItemCard(it);
+      placeCard(card, xy.x, xy.y);
+      canvas.appendChild(card);
+      // Persist auto-pos so DB stays consistent (only for unpinned).
+      if (!it.pinned && (it.canvas_x !== xy.x || it.canvas_y !== xy.y)) {
+        if (api()) api().update_auto_pos(it.id, xy.x, xy.y);
+        it.canvas_x = xy.x; it.canvas_y = xy.y;
+      }
+    }
+    for (const g of groups) {
+      const k = entityKey('group', g.id);
+      const { col, row } = positions.get(k) || { col: 0, row: 0 };
+      maxRow = Math.max(maxRow, row);
+      const xy = cellToXY(col, row);
+      const card = makeGroupCard(g);
+      placeCard(card, xy.x, xy.y);
+      canvas.appendChild(card);
+      if (!g.pinned && (g.canvas_x !== xy.x || g.canvas_y !== xy.y)) {
+        if (api()) api().update_group_auto_pos(g.id, xy.x, xy.y);
+        g.canvas_x = xy.x; g.canvas_y = xy.y;
+      }
+    }
+
+    // Update canvas height to fit grid + a few extra rows.
+    const minH = (maxRow + 4) * CELL_H + PADDING * 2;
+    canvas.style.minHeight = Math.max(minH, canvasWrap.clientHeight - 1) + 'px';
+
+    const total = allItems.length;
+    document.getElementById('count').textContent = total + ' 张';
+    document.getElementById('empty').classList.toggle('show', items.length === 0 && groups.length === 0);
+    refreshSelectionUI();
+  }
+
+  function placeCard(el, x, y) {
+    el.style.left = x + 'px';
+    el.style.top = y + 'px';
+  }
+
+  function makeItemCard(item) {
+    const el = document.createElement('div');
+    el.className = 'card';
+    el.dataset.kind = 'item';
+    el.dataset.id = item.id;
+    el.innerHTML = `
+      <div class="badge ${item.kind}">${item.kind === 'translated' ? '译图' : '原图'}</div>
+      <div class="thumb-wrap"><img src="${item.thumb_url}" alt=""></div>
+      <div class="label">${escapeHtml(item.name)}</div>
+    `;
+    attachCardInteractions(el, 'item', item.id);
+    return el;
+  }
+
+  function makeGroupCard(group) {
+    const members = allItems.filter(it => it.group_id === group.id)
+      .sort((a, b) => b.created_at - a.created_at);
+    const el = document.createElement('div');
+    el.className = 'group-card';
+    el.dataset.kind = 'group';
+    el.dataset.id = group.id;
+    // Up to 3 layered thumbnails: back, mid, front
+    const t0 = members[0] ? members[0].thumb_url : null;
+    const t1 = members[1] ? members[1].thumb_url : null;
+    const t2 = members[2] ? members[2].thumb_url : null;
+    el.innerHTML = `
+      ${t2 ? `<div class="stack-layer stack-back"><img src="${t2}" alt=""></div>` : ''}
+      ${t1 ? `<div class="stack-layer stack-mid"><img src="${t1}" alt=""></div>` : ''}
+      <div class="group-front">
+        ${t0 ? `<div class="thumb-wrap" style="height:170px;display:flex;align-items:center;justify-content:center;background:#f8f5ee;overflow:hidden;"><img src="${t0}" style="max-width:100%;max-height:100%;object-fit:contain;" alt=""></div>`
+             : `<div class="thumb-wrap" style="height:170px;background:#f8f5ee;"></div>`}
+        <div class="group-name">📁 ${escapeHtml(group.name)}</div>
+      </div>
+      <div class="group-count">${members.length}</div>
+    `;
+    attachCardInteractions(el, 'group', group.id);
+    return el;
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, c => (
+      { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+    ));
+  }
+
+  // ===================== Card interactions (click / drag / select / contextmenu) =====================
+  function attachCardInteractions(el, kind, id) {
+    let dragState = null;
+
+    el.addEventListener('mousedown', (e) => {
+      if (e.button !== 0) return;
+      // Selection logic on simple click (computed at mouseup based on whether we dragged).
+      const startX = e.clientX, startY = e.clientY;
+      const initLeft = parseFloat(el.style.left), initTop = parseFloat(el.style.top);
+      dragState = {
+        moved: false,
+        startX, startY,
+        initLeft, initTop,
+        kind, id,
+      };
+
+      function onMove(ev) {
+        if (!dragState) return;
+        const dx = ev.clientX - dragState.startX;
+        const dy = ev.clientY - dragState.startY;
+        if (!dragState.moved && Math.abs(dx) + Math.abs(dy) > 4) {
+          dragState.moved = true;
+          el.classList.add('dragging');
+        }
+        if (dragState.moved) {
+          el.style.left = (dragState.initLeft + dx) + 'px';
+          el.style.top  = (dragState.initTop + dy) + 'px';
+          highlightDropTarget(el, dragState);
+        }
+      }
+      function onUp(ev) {
+        document.removeEventListener('mousemove', onMove);
+        document.removeEventListener('mouseup', onUp);
+        if (!dragState) return;
+        if (dragState.moved) {
+          el.classList.remove('dragging');
+          handleDragEnd(el, dragState, ev);
+        } else {
+          handleClick(ev, kind, id);
+        }
+        clearDropTargets();
+        dragState = null;
+      }
+      document.addEventListener('mousemove', onMove);
+      document.addEventListener('mouseup', onUp);
+      e.stopPropagation();
+    });
+
+    el.addEventListener('dblclick', (e) => {
+      e.stopPropagation();
+      const it = kind === 'item' ? itemsById.get(id) : null;
+      const g  = kind === 'group' ? groupsById.get(id) : null;
+      if (it) openLightbox(it);
+      if (g) enterGroupDetail(g.id);
+    });
+
+    el.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      // If user right-clicks an unselected card → just select that one.
+      const k = entityKey(kind, id);
+      if (!selection.has(k)) {
+        clearSelection();
+        addToSelection(k);
+      }
+      showCtxMenu(e.clientX, e.clientY, kind, id);
+    });
+  }
+
+  function handleClick(ev, kind, id) {
+    const k = entityKey(kind, id);
+    if (ev.metaKey || ev.ctrlKey) {
+      // ⌘ click: toggle
+      if (selection.has(k)) selection.delete(k);
+      else selection.add(k);
+      lastSelectedKey = k;
+    } else if (ev.shiftKey && lastSelectedKey) {
+      // shift click: range select using main-canvas layout order
+      const order = layoutOrderKeys();
+      const a = order.indexOf(lastSelectedKey);
+      const b = order.indexOf(k);
+      if (a >= 0 && b >= 0) {
+        const [lo, hi] = a < b ? [a, b] : [b, a];
+        for (let i = lo; i <= hi; i++) selection.add(order[i]);
+      } else {
+        selection.add(k);
+      }
+    } else {
+      // plain click: single select
+      clearSelection();
+      addToSelection(k);
+      lastSelectedKey = k;
+    }
+    refreshSelectionUI();
+  }
+
+  function layoutOrderKeys() {
+    // Returns visual order (newest first → row-major). Pinned + unpinned mixed.
+    const positions = computeLayout();
+    const arr = Array.from(positions.entries()); // [k, {col,row}]
+    arr.sort((a, b) => {
+      const pa = a[1], pb = b[1];
+      if (pa.row !== pb.row) return pa.row - pb.row;
+      return pa.col - pb.col;
+    });
+    return arr.map(x => x[0]);
+  }
+
+  function addToSelection(k) { selection.add(k); }
+  function clearSelection() { selection.clear(); lastSelectedKey = null; }
+
+  function refreshSelectionUI() {
+    canvas.querySelectorAll('.card,.group-card').forEach(el => {
+      const k = entityKey(el.dataset.kind, el.dataset.id);
+      el.classList.toggle('selected', selection.has(k));
+    });
+    if (selection.size > 0) {
+      selBar.classList.add('show');
+      const itemCount = Array.from(selection).filter(k => k.startsWith('item:')).length;
+      const grpCount  = Array.from(selection).filter(k => k.startsWith('group:')).length;
+      const parts = [];
+      if (itemCount) parts.push(`${itemCount} 张`);
+      if (grpCount)  parts.push(`${grpCount} 个分组`);
+      selCount.textContent = parts.join(' · ') + ' 已选';
+      // 创建分组按钮：仅当至少 2 个 item 被选（不含 group）
+      document.getElementById('btn-group').disabled = !(itemCount >= 2 && grpCount === 0);
+    } else {
+      selBar.classList.remove('show');
+    }
+  }
+
+  // ===================== Drag-end logic =====================
+  function elementsAtClient(x, y) {
+    return document.elementsFromPoint(x, y);
+  }
+  function findDropTarget(draggedEl, ev) {
+    // Use the centre of the dragged element to find what it overlaps.
+    const r = draggedEl.getBoundingClientRect();
+    const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+    const els = elementsAtClient(cx, cy);
+    for (const el of els) {
+      if (el === draggedEl || draggedEl.contains(el)) continue;
+      const c = el.closest('.card, .group-card');
+      if (c && c !== draggedEl) return c;
+    }
+    return null;
+  }
+  function clearDropTargets() {
+    canvas.querySelectorAll('.drop-target').forEach(e => e.classList.remove('drop-target'));
+  }
+  function highlightDropTarget(draggedEl, dragState) {
+    clearDropTargets();
+    // Only items can drop-into-group; groups themselves cannot.
+    if (dragState.kind !== 'item') return;
+    const target = findDropTarget(draggedEl, null);
+    if (!target) return;
+    target.classList.add('drop-target');
+  }
+
+  async function handleDragEnd(el, dragState, ev) {
+    const target = findDropTarget(el, ev);
+    if (target && dragState.kind === 'item') {
+      const tKind = target.dataset.kind, tId = target.dataset.id;
+      await dropItemOnTarget(dragState.id, tKind, tId);
+      return;
+    }
+    // Otherwise: snap to grid + persist position (pinned=true).
+    const x = parseFloat(el.style.left), y = parseFloat(el.style.top);
+    const cell = xyToCell(x, y);
+    const xy = cellToXY(cell.col, cell.row);
+    el.style.left = xy.x + 'px';
+    el.style.top  = xy.y + 'px';
+
+    if (dragState.kind === 'item') {
+      const it = itemsById.get(dragState.id);
+      if (it) {
+        it.canvas_x = xy.x; it.canvas_y = xy.y; it.pinned = 1;
+        if (api()) await api().update_pos(dragState.id, xy.x, xy.y);
+      }
+    } else {
+      const g = groupsById.get(dragState.id);
+      if (g) {
+        g.canvas_x = xy.x; g.canvas_y = xy.y; g.pinned = 1;
+        if (api()) await api().update_group_pos(dragState.id, xy.x, xy.y);
+      }
+    }
+    // After pinning a card, other unpinned cards may need to re-flow.
+    renderAll();
+  }
+
+  async function dropItemOnTarget(itemId, tKind, tId) {
+    if (!api()) return;
+    const item = itemsById.get(itemId);
+    if (!item) return;
+    if (tKind === 'group') {
+      const r = await api().add_to_group(itemId, tId);
+      if (r && r.ok) {
+        item.group_id = tId;
+        showToast('已加入分组');
+      } else {
+        showToast('加入失败：' + (r && r.error || '未知错误'));
+      }
+    } else if (tKind === 'item') {
+      const target = itemsById.get(tId);
+      if (!target) return;
+      if (target.group_id) {
+        // Drop onto an item that's already in a group → join that group.
+        const r = await api().add_to_group(itemId, target.group_id);
+        if (r && r.ok) {
+          item.group_id = target.group_id;
+          showToast('已加入分组');
+        }
+      } else {
+        // Both ungrouped → create a new group.
+        const r = await api().create_group([itemId, tId]);
+        if (r && r.ok) {
+          const newGid = r.group_id;
+          const now = Date.now();
+          item.group_id = newGid;
+          target.group_id = newGid;
+          allGroups.unshift({
+            id: newGid, name: `分组 ${new Date().toLocaleString()}`,
+            canvas_x: 0, canvas_y: 0, pinned: 0, created_at: now,
+          });
+          groupsById.set(newGid, allGroups[0]);
+          showToast('已创建分组');
+        }
+      }
+    }
+    selection.clear();
+    renderAll();
+  }
+
+  // ===================== Marquee selection (drag on empty canvas) =====================
+  let marqueeState = null;
+  canvasWrap.addEventListener('mousedown', (e) => {
+    if (e.target !== canvas && e.target !== canvasWrap) return;
+    if (e.button !== 0) return;
+    if (!e.metaKey && !e.ctrlKey && !e.shiftKey) clearSelection();
+    const rect = canvas.getBoundingClientRect();
+    const startX = e.clientX - rect.left, startY = e.clientY - rect.top;
+    marqueeState = { startX, startY };
+    marquee.style.display = 'block';
+    marquee.style.left = startX + 'px';
+    marquee.style.top  = startY + 'px';
+    marquee.style.width = '0px'; marquee.style.height = '0px';
+
+    function onMove(ev) {
+      const cx = ev.clientX - rect.left, cy = ev.clientY - rect.top;
+      const x = Math.min(startX, cx), y = Math.min(startY, cy);
+      const w = Math.abs(cx - startX), h = Math.abs(cy - startY);
+      marquee.style.left = x + 'px'; marquee.style.top = y + 'px';
+      marquee.style.width = w + 'px'; marquee.style.height = h + 'px';
+    }
+    function onUp(ev) {
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+      const mr = marquee.getBoundingClientRect();
+      marquee.style.display = 'none';
+      // Hit-test: any card whose bounding rect intersects mr → add to selection.
+      canvas.querySelectorAll('.card,.group-card').forEach(el => {
+        const r = el.getBoundingClientRect();
+        const intersect = !(r.right < mr.left || r.left > mr.right ||
+                            r.bottom < mr.top || r.top > mr.bottom);
+        if (intersect) selection.add(entityKey(el.dataset.kind, el.dataset.id));
+      });
+      refreshSelectionUI();
+      marqueeState = null;
+    }
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+    refreshSelectionUI();
+  });
+
+  // ===================== Toolbar / selection-bar buttons =====================
+  document.getElementById('btn-relayout').addEventListener('click', () => {
+    if (!confirm('将所有未固定（未手动拖过）的图按时间重新排列？已固定的图不动。')) return;
+    renderAll();
+    showToast('已重新排列');
+  });
+  document.getElementById('btn-clear').addEventListener('click', () => {
+    clearSelection(); refreshSelectionUI();
+  });
+  document.getElementById('btn-group').addEventListener('click', async () => {
+    const itemIds = Array.from(selection).filter(k => k.startsWith('item:'))
+      .map(k => parseKey(k)[1]);
+    if (itemIds.length < 2) return;
+    if (!api()) return;
+    const r = await api().create_group(itemIds);
+    if (r && r.ok) {
+      const newGid = r.group_id;
+      const now = Date.now();
+      for (const iid of itemIds) {
+        const it = itemsById.get(iid);
+        if (it) it.group_id = newGid;
+      }
+      allGroups.unshift({
+        id: newGid, name: `分组 ${new Date().toLocaleString()}`,
+        canvas_x: 0, canvas_y: 0, pinned: 0, created_at: now,
+      });
+      groupsById.set(newGid, allGroups[0]);
+      clearSelection();
+      renderAll();
+      showToast('已创建分组');
+    } else {
+      showToast('创建失败：' + (r && r.error || ''));
+    }
+  });
+  document.getElementById('btn-delete-many').addEventListener('click', async () => {
+    const itemIds = Array.from(selection).filter(k => k.startsWith('item:')).map(k => parseKey(k)[1]);
+    const grpIds  = Array.from(selection).filter(k => k.startsWith('group:')).map(k => parseKey(k)[1]);
+    const total = itemIds.length + grpIds.length;
+    if (total === 0) return;
+    let msg = `确定删除 ${itemIds.length} 张图`;
+    if (grpIds.length) msg += `、${grpIds.length} 个分组（含组内图）`;
+    msg += '？此操作不可撤销。';
+    if (!confirm(msg)) return;
+    if (!api()) return;
+    if (itemIds.length) {
+      const r = await api().delete_many(itemIds);
+      if (!r.ok) { showToast('删除部分失败：' + r.error); return; }
+    }
+    for (const gid of grpIds) {
+      await api().delete_group_with_items(gid);
+    }
+    // Refresh local state
+    allItems = allItems.filter(it => !itemIds.includes(it.id) && !grpIds.includes(it.group_id));
+    allGroups = allGroups.filter(g => !grpIds.includes(g.id));
+    itemsById.clear(); allItems.forEach(it => itemsById.set(it.id, it));
+    groupsById.clear(); allGroups.forEach(g => groupsById.set(g.id, g));
+    clearSelection();
+    renderAll();
+    showToast(`已删除 ${total} 项`);
+  });
+
+  // ===================== Keyboard =====================
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      if (groupDetail.classList.contains('show')) { exitGroupDetail(); return; }
+      if (lightbox.classList.contains('show')) { lightbox.classList.remove('show'); return; }
+      if (selection.size > 0) { clearSelection(); refreshSelectionUI(); return; }
+    }
+    // Ignore delete shortcut while a text input is focused.
+    const tag = (document.activeElement && document.activeElement.tagName) || '';
+    if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+    if ((e.key === 'Delete' || e.key === 'Backspace') && selection.size > 0
+        && !groupDetail.classList.contains('show')) {
+      e.preventDefault();
+      document.getElementById('btn-delete-many').click();
+    }
+  });
+
+  // ===================== Context menu =====================
+  function showCtxMenu(px, py, kind, id) {
+    ctxBody.innerHTML = '';
+    const item = kind === 'item' ? itemsById.get(id) : null;
+    const grp  = kind === 'group' ? groupsById.get(id) : null;
+    const selItems = Array.from(selection).filter(k => k.startsWith('item:')).map(k => parseKey(k)[1]);
+
+    function btn(label, cls, onClick) {
+      const b = document.createElement('button');
+      b.textContent = label;
+      if (cls) b.className = cls;
+      b.addEventListener('click', () => { hideCtxMenu(); onClick(); });
+      ctxBody.appendChild(b);
+    }
+    function sep() { ctxBody.appendChild(document.createElement('hr')); }
+
+    if (item) {
+      btn('查看大图', '', () => openLightbox(item));
+      btn('重命名', '', () => doRenameItem(item));
+      if (item.group_id) {
+        btn('移出分组', '', () => doRemoveFromGroup(item));
+      }
+      // Multi-select: only show "create group" when ≥2 items selected (incl. this).
+      if (selItems.length >= 2 && selection.has(entityKey('item', item.id))) {
+        btn(`创建分组 (${selItems.length})`, '', () => document.getElementById('btn-group').click());
+      }
+      sep();
+      if (selection.size > 1) {
+        btn(`删除选中（${selection.size}）`, 'danger', () => document.getElementById('btn-delete-many').click());
+      } else {
+        btn('删除', 'danger', () => doDeleteItem(item));
+      }
+    }
+    if (grp) {
+      btn('打开分组', '', () => enterGroupDetail(grp.id));
+      btn('重命名', '', () => doRenameGroup(grp));
+      btn('解散分组（保留图片）', '', () => doDissolveGroup(grp));
+      sep();
+      btn('删除分组（含图片）', 'danger', () => doDeleteGroupWithItems(grp));
+    }
+
+    ctx.style.left = px + 'px';
+    ctx.style.top = py + 'px';
+    ctx.classList.add('show');
+  }
+  function hideCtxMenu() { ctx.classList.remove('show'); }
+  document.addEventListener('mousedown', (e) => {
+    if (!ctx.contains(e.target)) hideCtxMenu();
+  });
+
+  // ===================== Lightbox =====================
   function openLightbox(item) {
     lightboxImg.src = item.file_url;
     lightbox.classList.add('show');
   }
   lightbox.addEventListener('click', () => lightbox.classList.remove('show'));
-  document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') lightbox.classList.remove('show');
-  });
 
-  // ---------- Context menu ----------
-  const ctx = document.getElementById('ctx');
-  let ctxItem = null;
-  function showContextMenu(px, py, item) {
-    ctxItem = item;
+  // ===================== Group detail view =====================
+  let currentGroupId = null;
+  function enterGroupDetail(gid) {
+    currentGroupId = gid;
+    const g = groupsById.get(gid);
+    if (!g) return;
+    groupDetailName.textContent = g.name;
+    renderGroupDetail();
+    groupDetail.classList.add('show');
+  }
+  function exitGroupDetail() {
+    currentGroupId = null;
+    groupDetail.classList.remove('show');
+    renderAll(); // re-render in case membership changed
+  }
+  function renderGroupDetail() {
+    if (!currentGroupId) return;
+    const members = allItems.filter(it => it.group_id === currentGroupId)
+      .sort((a, b) => b.created_at - a.created_at);
+    groupDetailGrid.innerHTML = '';
+    groupDetailCount.textContent = members.length + ' 张';
+    for (const it of members) {
+      const card = document.createElement('div');
+      card.className = 'detail-card';
+      card.dataset.id = it.id;
+      card.innerHTML = `
+        <div class="badge ${it.kind}">${it.kind === 'translated' ? '译图' : '原图'}</div>
+        <div class="thumb-wrap"><img src="${it.thumb_url}" alt=""></div>
+        <div class="label">${escapeHtml(it.name)}</div>
+      `;
+      card.addEventListener('dblclick', () => openLightbox(it));
+      card.addEventListener('contextmenu', (e) => {
+        e.preventDefault();
+        showDetailCtxMenu(e.clientX, e.clientY, it);
+      });
+      groupDetailGrid.appendChild(card);
+    }
+  }
+  function showDetailCtxMenu(px, py, item) {
+    ctxBody.innerHTML = '';
+    const b1 = document.createElement('button');
+    b1.textContent = '查看大图';
+    b1.addEventListener('click', () => { hideCtxMenu(); openLightbox(item); });
+    ctxBody.appendChild(b1);
+    const b2 = document.createElement('button');
+    b2.textContent = '重命名';
+    b2.addEventListener('click', () => { hideCtxMenu(); doRenameItem(item); });
+    ctxBody.appendChild(b2);
+    const b3 = document.createElement('button');
+    b3.textContent = '移出分组';
+    b3.addEventListener('click', () => { hideCtxMenu(); doRemoveFromGroup(item); });
+    ctxBody.appendChild(b3);
+    const sep = document.createElement('hr'); ctxBody.appendChild(sep);
+    const b4 = document.createElement('button');
+    b4.textContent = '删除';
+    b4.className = 'danger';
+    b4.addEventListener('click', () => { hideCtxMenu(); doDeleteItem(item); });
+    ctxBody.appendChild(b4);
     ctx.style.left = px + 'px';
     ctx.style.top = py + 'px';
     ctx.classList.add('show');
   }
-  function hideContextMenu() { ctx.classList.remove('show'); ctxItem = null; }
-  document.addEventListener('mousedown', (e) => {
-    if (!ctx.contains(e.target)) hideContextMenu();
+  document.getElementById('btn-group-back').addEventListener('click', exitGroupDetail);
+  groupDetailName.addEventListener('dblclick', () => {
+    if (!currentGroupId) return;
+    const g = groupsById.get(currentGroupId);
+    if (!g) return;
+    const name = prompt('分组名称', g.name);
+    if (name == null || !name.trim() || name.trim() === g.name) return;
+    api() && api().rename_group(g.id, name.trim()).then(r => {
+      if (r && r.ok) {
+        g.name = name.trim();
+        groupDetailName.textContent = g.name;
+        showToast('已重命名');
+      }
+    });
   });
-  ctx.addEventListener('click', async (e) => {
-    const act = e.target.dataset.act;
-    if (!act || !ctxItem) return;
-    const item = ctxItem;
-    hideContextMenu();
-    if (act === 'open') openLightbox(item);
-    else if (act === 'rename') doRename(item);
-    else if (act === 'delete') doDelete(item);
+  document.getElementById('btn-group-dissolve').addEventListener('click', async () => {
+    if (!currentGroupId) return;
+    const g = groupsById.get(currentGroupId);
+    if (!g) return;
+    if (!confirm(`解散分组「${g.name}」？图片会回到画廊主视图（按时间重新流入网格）。`)) return;
+    if (!api()) return;
+    const r = await api().dissolve_group(g.id);
+    if (r && r.ok) {
+      // Local state cleanup
+      for (const it of allItems) {
+        if (it.group_id === g.id) it.group_id = null;
+      }
+      allGroups = allGroups.filter(x => x.id !== g.id);
+      groupsById.delete(g.id);
+      exitGroupDetail();
+      showToast('已解散分组');
+    }
+  });
+  document.getElementById('btn-group-delete').addEventListener('click', async () => {
+    if (!currentGroupId) return;
+    const g = groupsById.get(currentGroupId);
+    if (!g) return;
+    const members = allItems.filter(it => it.group_id === g.id);
+    if (!confirm(`删除分组「${g.name}」+ ${members.length} 张图片？此操作不可撤销。`)) return;
+    if (!api()) return;
+    const r = await api().delete_group_with_items(g.id);
+    if (r && r.ok) {
+      allItems = allItems.filter(it => it.group_id !== g.id);
+      allGroups = allGroups.filter(x => x.id !== g.id);
+      itemsById.clear(); allItems.forEach(it => itemsById.set(it.id, it));
+      groupsById.delete(g.id);
+      exitGroupDetail();
+      showToast('已删除分组');
+    }
   });
 
-  async function doRename(item) {
+  // ===================== CRUD wrappers =====================
+  async function doRenameItem(item) {
     const name = prompt('重命名', item.name);
     if (name == null) return;
-    const trimmed = name.trim();
-    if (!trimmed || trimmed === item.name) return;
-    if (window.pywebview && window.pywebview.api) {
-      const r = await window.pywebview.api.rename(item.id, trimmed);
-      if (r && r.ok) {
-        item.name = trimmed;
-        const card = cardById.get(item.id);
-        if (card) { card._labelText.text(trimmed); cardLayer.batchDraw(); }
-        showToast('已重命名');
-      } else {
-        showToast('重命名失败：' + (r && r.error || '未知错误'));
-      }
+    const t = name.trim();
+    if (!t || t === item.name) return;
+    if (!api()) return;
+    const r = await api().rename(item.id, t);
+    if (r && r.ok) {
+      item.name = t;
+      // Update in-place if visible
+      canvas.querySelectorAll(`.card[data-id="${item.id}"] .label`)
+        .forEach(el => el.textContent = t);
+      groupDetailGrid.querySelectorAll(`.detail-card[data-id="${item.id}"] .label`)
+        .forEach(el => el.textContent = t);
+      showToast('已重命名');
     }
   }
-  async function doDelete(item) {
+  async function doDeleteItem(item) {
     if (!confirm(`确定删除「${item.name}」？此操作不可撤销。`)) return;
-    if (window.pywebview && window.pywebview.api) {
-      const r = await window.pywebview.api.delete(item.id);
-      if (r && r.ok) {
-        items = items.filter(x => x.id !== item.id);
-        const card = cardById.get(item.id);
-        if (card) { card.destroy(); cardById.delete(item.id); cardLayer.batchDraw(); }
-        document.getElementById('count').textContent = items.length + ' 张';
-        document.getElementById('empty').classList.toggle('show', items.length === 0);
-        showToast('已删除');
-      } else {
-        showToast('删除失败：' + (r && r.error || '未知错误'));
-      }
+    if (!api()) return;
+    const r = await api().delete(item.id);
+    if (r && r.ok) {
+      allItems = allItems.filter(x => x.id !== item.id);
+      itemsById.delete(item.id);
+      if (currentGroupId) renderGroupDetail();
+      else renderAll();
+      showToast('已删除');
+    }
+  }
+  async function doRemoveFromGroup(item) {
+    if (!api()) return;
+    const r = await api().remove_from_group(item.id);
+    if (r && r.ok) {
+      item.group_id = null;
+      if (currentGroupId) renderGroupDetail();
+      else renderAll();
+      showToast('已移出分组');
+    }
+  }
+  async function doRenameGroup(g) {
+    const name = prompt('分组名称', g.name);
+    if (name == null) return;
+    const t = name.trim();
+    if (!t || t === g.name) return;
+    if (!api()) return;
+    const r = await api().rename_group(g.id, t);
+    if (r && r.ok) {
+      g.name = t;
+      renderAll();
+      showToast('已重命名');
+    }
+  }
+  async function doDissolveGroup(g) {
+    if (!confirm(`解散分组「${g.name}」？图片会回到画廊主视图。`)) return;
+    if (!api()) return;
+    const r = await api().dissolve_group(g.id);
+    if (r && r.ok) {
+      for (const it of allItems) if (it.group_id === g.id) it.group_id = null;
+      allGroups = allGroups.filter(x => x.id !== g.id);
+      groupsById.delete(g.id);
+      renderAll();
+      showToast('已解散');
+    }
+  }
+  async function doDeleteGroupWithItems(g) {
+    const members = allItems.filter(it => it.group_id === g.id);
+    if (!confirm(`删除分组「${g.name}」+ ${members.length} 张图片？此操作不可撤销。`)) return;
+    if (!api()) return;
+    const r = await api().delete_group_with_items(g.id);
+    if (r && r.ok) {
+      allItems = allItems.filter(it => it.group_id !== g.id);
+      allGroups = allGroups.filter(x => x.id !== g.id);
+      itemsById.clear(); allItems.forEach(it => itemsById.set(it.id, it));
+      groupsById.delete(g.id);
+      renderAll();
+      showToast('已删除');
     }
   }
 
-  // ---------- Toast ----------
-  let toastTimer = null;
-  function showToast(msg) {
-    const t = document.getElementById('toast');
-    t.textContent = msg; t.classList.add('show');
-    clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => t.classList.remove('show'), 1800);
+  // ===================== Init =====================
+  window.addEventListener('resize', () => {
+    canvas.style.minHeight = canvasWrap.clientHeight + 'px';
+  });
+  // pywebview API may not be ready immediately on first paint
+  if (window.pywebview && window.pywebview.api) {
+    renderAll();
+  } else {
+    window.addEventListener('pywebviewready', renderAll);
+    setTimeout(renderAll, 100);
   }
-
-  // ---------- Toolbar ----------
-  document.getElementById('btn-reset').addEventListener('click', () => {
-    stage.scale({ x: 1, y: 1 });
-    stage.position({ x: 0, y: 0 });
-    stage.batchDraw();
-  });
-  document.getElementById('btn-fit').addEventListener('click', () => {
-    if (cardById.size === 0) return;
-    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-    cardById.forEach((g) => {
-      const r = g.getClientRect({ relativeTo: stage });
-      minX = Math.min(minX, r.x); minY = Math.min(minY, r.y);
-      maxX = Math.max(maxX, r.x + r.width); maxY = Math.max(maxY, r.y + r.height);
-    });
-    const padding = 60;
-    const bw = maxX - minX, bh = maxY - minY;
-    const sw = stage.width(), sh = stage.height();
-    const s = clamp(Math.min((sw - padding * 2) / bw, (sh - padding * 2) / bh), ZOOM_MIN, ZOOM_MAX);
-    stage.scale({ x: s, y: s });
-    stage.position({
-      x: (sw - bw * s) / 2 - minX * s,
-      y: (sh - bh * s) / 2 - minY * s,
-    });
-    stage.batchDraw(); gridLayer.batchDraw();
-  });
-
-  // ---------- Init ----------
-  renderAll();
 })();
 </script>
 </body>

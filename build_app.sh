@@ -44,7 +44,7 @@ fi
 
 # 6. Build a simple .dmg via hdiutil (no signing, no fancy layout).
 echo "==> building dmg"
-DMG_NAME="LocalTranslator-2.0.0.dmg"
+DMG_NAME="LocalTranslator-2.1.0.dmg"
 DMG_TMP="dist/.dmg-staging"
 rm -rf "$DMG_TMP" "dist/$DMG_NAME"
 mkdir -p "$DMG_TMP"
@@ -57,3 +57,82 @@ hdiutil create -volname "Local Translator" \
 rm -rf "$DMG_TMP"
 
 echo "==> dmg done: dist/$DMG_NAME ($(du -sh "dist/$DMG_NAME" | cut -f1))"
+
+# 7. Install (or refresh) the right-click "Translate" Service for the
+#    current user. Lives under ~/Library/Application Support/ to dodge
+#    the macOS TCC sandbox that blocks Automator from running scripts
+#    in ~/Documents. The Automator workflow itself goes to
+#    ~/Library/Services/ and points to a no-space symlink under
+#    ~/.local/bin/ so the shell parser doesn't choke on path spaces.
+echo "==> installing right-click translate service"
+SCRIPT_SRC="$(pwd)/scripts/translate-service.sh"
+SAFE_DIR="$HOME/Library/Application Support/LocalTranslator/bin"
+ALIAS_DIR="$HOME/.local/bin"
+mkdir -p "$SAFE_DIR" "$ALIAS_DIR"
+cp "$SCRIPT_SRC" "$SAFE_DIR/translate-service.sh"
+chmod +x "$SAFE_DIR/translate-service.sh"
+ln -sf "$SAFE_DIR/translate-service.sh" "$ALIAS_DIR/lt-translate.sh"
+
+WF="$HOME/Library/Services/Translate.workflow"
+mkdir -p "$WF/Contents"
+cat > "$WF/Contents/Info.plist" <<'INFOEOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>NSServices</key>
+	<array>
+		<dict>
+			<key>NSMenuItem</key><dict><key>default</key><string>Translate</string></dict>
+			<key>NSMessage</key><string>runWorkflowAsService</string>
+			<key>NSSendTypes</key><array><string>NSStringPboardType</string><string>public.utf8-plain-text</string></array>
+		</dict>
+	</array>
+</dict>
+</plist>
+INFOEOF
+cat > "$WF/Contents/document.wflow" <<WFEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>AMApplicationBuild</key><string>523</string>
+	<key>AMApplicationVersion</key><string>2.10</string>
+	<key>AMDocumentVersion</key><string>2</string>
+	<key>actions</key><array><dict>
+		<key>action</key><dict>
+			<key>AMAccepts</key><dict><key>Container</key><string>List</string><key>Optional</key><true/><key>Types</key><array><string>com.apple.cocoa.string</string></array></dict>
+			<key>AMActionVersion</key><string>2.0.3</string>
+			<key>AMApplication</key><array><string>Automator</string></array>
+			<key>AMParameterProperties</key><dict><key>COMMAND_STRING</key><dict/><key>CheckedForUserDefaultShell</key><dict/><key>inputMethod</key><dict/><key>shell</key><dict/><key>source</key><dict/></dict>
+			<key>AMProvides</key><dict><key>Container</key><string>List</string><key>Types</key><array><string>com.apple.cocoa.string</string></array></dict>
+			<key>ActionBundlePath</key><string>/System/Library/Automator/Run Shell Script.action</string>
+			<key>ActionName</key><string>Run Shell Script</string>
+			<key>ActionParameters</key><dict>
+				<key>COMMAND_STRING</key><string>$ALIAS_DIR/lt-translate.sh</string>
+				<key>CheckedForUserDefaultShell</key><true/>
+				<key>inputMethod</key><integer>0</integer>
+				<key>shell</key><string>/bin/bash</string>
+				<key>source</key><string></string>
+			</dict>
+			<key>BundleIdentifier</key><string>com.apple.RunShellScript</string>
+			<key>CFBundleVersion</key><string>2.0.3</string>
+			<key>Class Name</key><string>RunShellScriptAction</string>
+			<key>InputUUID</key><string>D4D049FB-6D3C-4E0C-9B6A-1F53A0B5F45D</string>
+			<key>OutputUUID</key><string>E7F14A2B-8C5D-4F1A-B3E6-2A64C1D6F78E</string>
+			<key>UUID</key><string>A1B2C3D4-E5F6-7890-ABCD-EF1234567890</string>
+		</dict>
+		<key>isViewVisible</key><true/>
+	</dict></array>
+	<key>connectors</key><dict/>
+	<key>workflowMetaData</key><dict>
+		<key>serviceInputTypeIdentifier</key><string>com.apple.Automator.text</string>
+		<key>serviceOutputTypeIdentifier</key><string>com.apple.Automator.nothing</string>
+		<key>serviceProcessesInput</key><integer>0</integer>
+		<key>workflowTypeIdentifier</key><string>com.apple.Automator.servicesMenu</string>
+	</dict>
+</dict>
+</plist>
+WFEOF
+/System/Library/CoreServices/pbs -flush 2>/dev/null || true
+echo "==> service installed at $WF (cmd: $ALIAS_DIR/lt-translate.sh)"
