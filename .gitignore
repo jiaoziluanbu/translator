@@ -13,3 +13,6 @@ dist.old*/
 swift/translator-helper
 swift/probe-prepare
 scripts/probe/gallery_preview/
+
+# Local working state (跨会话上下文 + 个人备注，不进 git)
+workspace.md

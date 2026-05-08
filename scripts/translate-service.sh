@@ -6,12 +6,22 @@
 # and shows the result in a native macOS dialog with a Copy button.
 set -euo pipefail
 
-HELPER="/Users/jiaozidemacmini/Documents/自制产品/translator/swift/translator-helper"
-PROJECT="/Users/jiaozidemacmini/Documents/自制产品/translator"
+# Resolve helper + project paths. Prefer the installed .app bundle (so this
+# script works on any machine after `bash build_app.sh`); fall back to a path
+# relative to this script (dev tree).
+APP_RES="/Applications/Local Translator.app/Contents/Resources"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [ -x "$APP_RES/swift/translator-helper" ]; then
+    HELPER="$APP_RES/swift/translator-helper"
+    PROJECT="$APP_RES"
+else
+    HELPER="$SCRIPT_DIR/../swift/translator-helper"
+    PROJECT="$SCRIPT_DIR/.."
+fi
 
 # Locate a Python that has argostranslate installed (for fallback path).
 PY=""
-for p in /opt/homebrew/bin/python3 /usr/local/bin/python3 /Users/jiaozidemacmini/Library/Python/3.9/bin/python3 python3; do
+for p in /opt/homebrew/bin/python3 /usr/local/bin/python3 "$HOME/Library/Python/3.9/bin/python3" python3; do
     if "$p" -c "import argostranslate" 2>/dev/null; then PY="$p"; break; fi
 done
 
