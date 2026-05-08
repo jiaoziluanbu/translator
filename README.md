@@ -26,7 +26,7 @@ macOS 截图翻译 + 编辑 + 画廊管理工具。全程离线，不上传任�
 
 下载完之后：
 
-1. 双击 `LocalTranslator-2.1.0.dmg`（或当前最新版），把 **Local Translator.app** 拖到 Applications。
+1. 双击 `LocalTranslator-2.1.1.dmg`（或当前最新版），把 **Local Translator.app** 拖到 Applications。
 2. 第一次启动会被 Gatekeeper 拦：**右键点应用 → 打开 → 再点确认**。之后随便启。
 3. 启动后菜单栏会出现 **译** 字。
 4. 首次使用需授权两个东西：
