@@ -1,6 +1,6 @@
 # Local Translator — 工作状态
 
-> 创建于 2026-04-23，最后更新于 2026-05-05（会话 11，v2.1.0：截图体验 + 画廊重构 + Service 修复）
+> 创建于 2026-04-23，最后更新于 2026-05-08（会话 12：右栏文本可选+复制）
 
 ## 流程 Checklist
 
@@ -16,6 +16,66 @@
 - **阶段**：v2.1.0 已收尾，截图体验大改（不抢焦点 / 颜色还原 / 选区透明 / toolbar / 节流）+ 画廊网格化（卡片统一/吸附/多选/分组）+ 右键服务恢复
 - **阻塞项**：无
 - **下次方向（可选）**：第二次 ⌃⌥A 时若 hot worker 替补还没 ready，cold fallback ~3-5s。可扩池到 2 个进一步丝滑（成本 +400MB 内存）
+
+## 2026-05-08 会话 12：编辑器右栏支持选中复制原文/译文（含右键菜单+全选）
+
+### 第一轮：拖选 + ⌘C + 悬浮按钮
+
+之前 `editor.html` 右栏 `.src/.tgt` 没有显式 `user-select`，加上 `body` 默认 inherit 不可选 + ⌘C 被全局劫持为「复制画布 PNG」，所以用户根本没法复制原文/译文。修法：
+
+- **CSS**：`body { user-select:none }` 锁住 UI chrome，`.para .src/.tgt` 显式 `user-select:text + cursor:text`，加 `::selection` 蓝色高亮配色。
+- **JS 选择优先级**：新增 `sidebarSelectionText()` 检测当前 `window.getSelection()` 是否落在 `#sidebar` 内；⌘C 命中此分支时走 `copyTextToClipboard()`（`navigator.clipboard.writeText` + `execCommand('copy')` textarea 兜底），不再走 PNG 复制。
+- **快捷键不撞键**：单字母工具切换（v/r/c/...）此前会在用户拖选文本时把工具切了；加 `if (sidebarSelectionText()) return` 提前 bail。
+- **每段悬浮按钮**：每个 `.para` 加 `.copy-row` (复制原文 / 复制译文 / 复制全部)，`opacity:0` 默认隐，`:hover` 显出；`mousedown preventDefault` 保住选区不丢。
+
+### 第四轮：截图浮层条按钮文案「编辑」→「编辑/翻译」
+
+`ui/capture.py` overlay 拖框完毕后的浮层条中间按钮文案改为「✏️ 编辑/翻译」更直白。涉及：
+- 文案：`_draw_toolbar()` 的 button labels dict、文件顶部 docstring。
+- 布局：原 button 宽度 64pt 装不下 5 字 + emoji，新增 `_TB_EDIT_BTN_W=100`，工具条总宽 `_TB_W` 232→268，重排 copy/edit/cancel 三个 rect。
+
+部署：v2.1.0 那次记下的「`ui/capture.py` 被打进 zip 改源没用」其实是不完整的判断 —— `__boot__.py::_reset_sys_path()` 是把 `Resources/` 从 sys.path 摘了，但 `daemon.py` 在 worker 启动入口三个地方（pre-`from ui.capture import ...`）显式 `sys.path.insert(0, RESOURCES)` 把它加回来了（line 659/799/842）。所以 import `ui.capture` 时实际是 **优先**走 `Resources/ui/capture.py`，**而不是** zip 里的 `ui/capture.pyc`。
+
+正确的最小部署是 `cp ui/capture.py` 到两份 bundle 的 `Resources/ui/`。本轮我先误以为只能改 zip 里的 .pyc，做了一次 py_compile + zip -q 注入但没碰 .py，重启后 daemon 仍然 import 旧的 .py，所以"重启后没生效"。修正：把 .py 也 cp 过去。
+
+zip 里的 .pyc 就当 fallback 留着（用 `/usr/bin/python3` 3.9.6 编译，magic `610d0d0a` 与 bundle 内嵌 Python 一致），即使 daemon 路径调整不再 prepend Resources，import 也会有正确的 .pyc 命中。
+
+生效时机：daemon 启动时 spawn hot worker，下一次 ⌃⌥A 立即用新文案。已 `pkill -f "Local Translator.app"` + `open -a "Local Translator"` 拉起新 daemon（PID 3239 / 17:30）。
+
+### 第三轮：根据选区自适应的浮动复制条
+
+划选后在选区附近（默认上方，挤到顶就翻到下方）弹一条暗色 toolbar，按选区跨段数动态变按钮：
+
+- 选区在 1 段内 → 「复制选中文本 / 本段原文 / 本段译文 / 本段全部」
+- 选区跨 ≥2 段 → 「复制选中文本 / 选中 N 段原文 / 选中 N 段译文 / 选中 N 段全部」
+- 头部小 chip 显示 `N 段 · M 字`。
+
+实现：
+- DOM 加 `<div id=sel-bar>`，CSS 高亮蓝边 + flex 行 + viewport clamp。
+- `getSelectedParas()` 用 `Range.intersectsNode(p)` 过滤 `.para` 算覆盖段数；`paraListTexts(paras)` 按段聚合。
+- 触发：`document.mouseup` → `requestAnimationFrame(refreshSelBar)`（drag 完毕选区已稳定）；⌘A 全选侧栏后也调一次。
+- 收起：`selectionchange` 检到 collapsed → hide；外点（capture phase）→ hide；blur / resize / scroll → hide。
+- 按钮 `mousedown preventDefault` 防止点按时丢选区；点击走同一个 `copyTextToClipboard()`。
+
+注意：右键菜单和 hover 行小按钮都保留 —— 三套机制各有最优场景（划词→浮动条；不划→ hover 行；任意时候→右键菜单），互不冲突。
+
+### 第二轮：⌘A 全选 + 自定义右键菜单
+
+- **⌘A 全选侧栏**：keydown capture 阶段，鼠标在 `#sidebar` 内或当前已有侧栏选区时，构造 `Range.selectNodeContents(#sidebar-inner)` 整体选中。捕获阶段优先级高于 Konva。
+- **自定义 contextmenu**：`#sidebar.contextmenu` 弹暗色菜单（`#ctx-menu`，position:fixed + viewport clamp + outside-click/blur/scroll 自动收起）。菜单条目按命中状态动态拼装：
+  - 命中文本选区：「复制选中文本 ⌘C」
+  - 命中具体段落：「复制本段原文 / 译文 / 全部」「选中本段」
+  - 通用：「复制全部原文 / 全部译文 / 全部原文+译文」「全选 ⌘A」
+  - 无内容的项 disabled 灰显。
+- **辅助函数**：`paraAtPoint(x,y)` (elementFromPoint 上溯找 `.para`)、`paraTexts(el)` (跳过 copy-row 直接读 `.src/.tgt`)、`allTexts(joiner)` (聚合所有段)、`selectPara(el)` / `selectAllSidebar()` (Range API)。
+
+文件：`ui/editor.html`（CSS 加 `#ctx-menu` + body DOM 加 `<div id=ctx-menu>` + JS 加 ~180 行菜单/选区/⌘A 逻辑）。Node `new Function(...)` 解析通过。
+
+部署：editor.html 在 bundle 里位于 `Resources/ui/editor.html`（不在 python39.zip），直接 `cp` 到 `dist/.../Resources/ui/` 与 `/Applications/.../Resources/ui/` 即时生效，新开 editor 立刻能用，无需重 build / 不动 daemon。
+
+回归点：原来的 ⌘C 复制 PNG 行为在没选中文字时保持不变；保存图、保存带译文、画布裁剪、标注工具都未触碰。
+
+---
 
 ## 2026-05-05 会话 11：v2.1.0（截图体验 + 画廊重构 + Service 修复）
 

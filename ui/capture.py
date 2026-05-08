@@ -5,7 +5,7 @@ after mouseUp a small toolbar appears below (or above, if there's no room
 below) the selection with three buttons:
 
   📋 复制     — copy PNG to pasteboard, return action="copy"
-  ✏️ 编辑     — open editor (legacy default), return action="edit"
+  ✏️ 编辑/翻译 — open editor (legacy default), return action="edit"
   ✕  取消     — discard, return None
 
 ESC also discards. Clicking outside the toolbar (and outside the selection)
@@ -61,10 +61,11 @@ class CaptureResult:
 
 
 # Toolbar layout (AppKit points)
-_TB_W = 232
+_TB_W = 268            # widened to fit "✏️ 编辑/翻译" middle button
 _TB_H = 40
 _TB_GAP = 12          # vertical gap between selection edge and toolbar
-_TB_BTN_W = 64
+_TB_BTN_W = 64        # default width — used for 复制 / 取消
+_TB_EDIT_BTN_W = 100  # wider middle button for "✏️ 编辑/翻译"
 _TB_BTN_H = 28
 _TB_BTN_GAP = 6
 _TB_PADDING_X = 12
@@ -125,14 +126,15 @@ class _OverlayView(NSView):
 
         toolbar = NSRect(NSPoint(tb_x, tb_y), NSSize(_TB_W, _TB_H))
 
-        # Three buttons left→right: copy, edit, cancel
+        # Three buttons left→right: copy, edit, cancel.
+        # Edit button is wider to fit "✏️ 编辑/翻译"; copy/cancel stay default.
         btn_y = tb_y + (_TB_H - _TB_BTN_H) / 2
         x0 = tb_x + _TB_PADDING_X
         copy_rect = NSRect(NSPoint(x0, btn_y), NSSize(_TB_BTN_W, _TB_BTN_H))
         x0 += _TB_BTN_W + _TB_BTN_GAP
-        edit_rect = NSRect(NSPoint(x0, btn_y), NSSize(_TB_BTN_W, _TB_BTN_H))
-        x0 += _TB_BTN_W + _TB_BTN_GAP
-        cancel_w = _TB_W - _TB_PADDING_X * 2 - (_TB_BTN_W * 2 + _TB_BTN_GAP * 2)
+        edit_rect = NSRect(NSPoint(x0, btn_y), NSSize(_TB_EDIT_BTN_W, _TB_BTN_H))
+        x0 += _TB_EDIT_BTN_W + _TB_BTN_GAP
+        cancel_w = _TB_W - _TB_PADDING_X * 2 - _TB_BTN_W - _TB_EDIT_BTN_W - _TB_BTN_GAP * 2
         cancel_rect = NSRect(NSPoint(x0, btn_y), NSSize(cancel_w, _TB_BTN_H))
 
         return toolbar, {"copy": copy_rect, "edit": edit_rect, "cancel": cancel_rect}
@@ -295,7 +297,7 @@ class _OverlayView(NSView):
         # Buttons
         labels = {
             "copy":   "📋 复制",
-            "edit":   "✏️ 编辑",
+            "edit":   "✏️ 编辑/翻译",
             "cancel": "✕",
         }
         # Cancel uses red-ish accent; others are white text on subtle hover bg.

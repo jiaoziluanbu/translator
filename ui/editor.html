@@ -15,7 +15,8 @@
     --accent: #5eb0ff;
   }
   html, body { margin: 0; padding: 0; height: 100%; background: var(--bg); color: var(--text);
-    font: 13px/1.45 -apple-system, "PingFang SC", system-ui, sans-serif; }
+    font: 13px/1.45 -apple-system, "PingFang SC", system-ui, sans-serif;
+    -webkit-user-select: none; user-select: none; }
 
   /* Toolbar pinned at top. flex-wrap: wrap is a safety net — if the user
      drags the window narrower than MIN_WIN_W can guarantee, the right
@@ -67,9 +68,19 @@
   .para { position: absolute; left: 12px; right: 12px; background: #2f2f2f; border: 1px solid var(--border);
     border-radius: 6px; padding: 6px 8px; box-sizing: border-box; }
   .para .src { color: var(--muted); font-size: 11px; line-height: 1.4; margin-bottom: 4px; white-space: pre-wrap;
-    word-break: break-word; }
-  .para .tgt { color: var(--text); font-size: 13px; line-height: 1.45; white-space: pre-wrap; word-break: break-word; }
+    word-break: break-word; -webkit-user-select: text; user-select: text; cursor: text; }
+  .para .tgt { color: var(--text); font-size: 13px; line-height: 1.45; white-space: pre-wrap; word-break: break-word;
+    -webkit-user-select: text; user-select: text; cursor: text; }
+  .para .src::selection, .para .tgt::selection { background: rgba(94, 176, 255, 0.35); color: #fff; }
   .para.empty { border-style: dashed; opacity: 0.5; }
+  /* Hover-revealed mini copy buttons in each paragraph */
+  .para .copy-row { display: flex; gap: 4px; margin-top: 4px; opacity: 0; transition: opacity .12s ease;
+    -webkit-user-select: none; user-select: none; }
+  .para:hover .copy-row { opacity: 1; }
+  .para .copy-btn { background: #383838; color: var(--muted); border: 1px solid var(--border);
+    border-radius: 4px; padding: 2px 6px; font-size: 10px; cursor: pointer; line-height: 1.2; }
+  .para .copy-btn:hover { background: #4a4a4a; color: var(--text); border-color: var(--accent); }
+  .para .copy-btn:active { background: #2c2c2c; }
   #empty-hint { color: var(--muted); text-align: center; padding: 20px; font-size: 12px; }
   #pending-hint { display: flex; flex-direction: column; align-items: center; justify-content: center;
     gap: 12px; padding: 60px 20px; color: var(--muted); font-size: 12px; }
@@ -83,6 +94,34 @@
     background: rgba(0,0,0,0.82); color: #fff; padding: 8px 14px; border-radius: 6px;
     font-size: 12px; opacity: 0; transition: opacity .2s; pointer-events: none; z-index: 50; }
   #toast.show { opacity: 1; }
+
+  /* Floating selection toolbar — appears next to a sidebar text selection.
+     Buttons inside it adapt to how many .para elements the range covers. */
+  #sel-bar { position: fixed; z-index: 90; display: none; gap: 4px; padding: 4px;
+    background: rgba(20,20,20,0.95); border: 1px solid var(--accent); border-radius: 6px;
+    box-shadow: 0 4px 14px rgba(0,0,0,0.55);
+    -webkit-user-select: none; user-select: none; }
+  #sel-bar.show { display: flex; }
+  #sel-bar button { background: #37506f; color: #fff; border: 1px solid var(--accent);
+    border-radius: 4px; padding: 4px 10px; cursor: pointer; font-size: 12px;
+    white-space: nowrap; line-height: 1.2; }
+  #sel-bar button:hover { background: #4a6a8a; }
+  #sel-bar button:active { background: #2a4060; }
+  #sel-bar .sel-meta { color: var(--muted); font-size: 11px; padding: 0 4px; align-self: center;
+    border-right: 1px solid var(--border); margin-right: 2px; }
+
+  /* Custom right-click context menu for sidebar text actions */
+  #ctx-menu { position: fixed; z-index: 100; min-width: 180px; background: #2a2a2a;
+    border: 1px solid var(--border); border-radius: 6px; padding: 4px 0;
+    box-shadow: 0 6px 20px rgba(0,0,0,0.5); display: none;
+    -webkit-user-select: none; user-select: none; font-size: 13px; }
+  #ctx-menu.show { display: block; }
+  #ctx-menu .ctx-item { padding: 6px 14px; color: var(--text); cursor: pointer; white-space: nowrap; }
+  #ctx-menu .ctx-item:hover { background: #37506f; color: #fff; }
+  #ctx-menu .ctx-item.disabled { color: #666; cursor: default; }
+  #ctx-menu .ctx-item.disabled:hover { background: transparent; color: #666; }
+  #ctx-menu .ctx-sep { height: 1px; background: var(--border); margin: 4px 0; }
+  #ctx-menu .ctx-shortcut { color: var(--muted); float: right; margin-left: 24px; font-size: 11px; }
 
   /* Inline text input (for text tool) */
   #text-input { position: absolute; background: transparent; border: 1px dashed var(--accent);
@@ -151,6 +190,8 @@
   </div>
 </div>
 <div id="toast"></div>
+<div id="sel-bar" role="toolbar"></div>
+<div id="ctx-menu" role="menu"></div>
 <script>
 (async function() {
   const payload = window.__EDITOR_PAYLOAD__ || {
@@ -250,6 +291,25 @@
       const s = document.createElement('div'); s.className = 'src'; s.textContent = p.src_text;
       const t = document.createElement('div'); t.className = 'tgt'; t.textContent = p.tgt_text || '(无译文)';
       el.appendChild(s); el.appendChild(t);
+      // Hover copy buttons. On click: copy that field's text and toast.
+      const row = document.createElement('div'); row.className = 'copy-row';
+      const mkBtn = (label, getText) => {
+        const b = document.createElement('button'); b.className = 'copy-btn'; b.textContent = label;
+        b.addEventListener('mousedown', (ev) => ev.preventDefault()); // keep current selection
+        b.addEventListener('click', async (ev) => {
+          ev.stopPropagation();
+          const txt = getText();
+          if (!txt) return;
+          await copyTextToClipboard(txt);
+          showToast('已复制' + label.replace(/^复制/, ''));
+        });
+        return b;
+      };
+      if (p.src_text) row.appendChild(mkBtn('复制原文', () => p.src_text));
+      if (p.tgt_text) row.appendChild(mkBtn('复制译文', () => p.tgt_text));
+      if (p.src_text && p.tgt_text) row.appendChild(mkBtn('复制全部',
+        () => p.src_text + '\n' + p.tgt_text));
+      if (row.childElementCount > 0) el.appendChild(row);
       inner.appendChild(el);
       return { el, top };
     });
@@ -558,11 +618,24 @@
     }
     if (meta && e.key.toLowerCase() === 'c'
         && !(document.activeElement && /input|textarea/i.test(document.activeElement.tagName))) {
+      // If user has highlighted text in the sidebar, ⌘C copies that text.
+      // Otherwise fall back to the original behavior (copy PNG of the canvas).
+      const selText = sidebarSelectionText();
+      if (selText) {
+        e.preventDefault();
+        copyTextToClipboard(selText).then(ok => {
+          showToast(ok ? '已复制所选文本' : '复制失败');
+        });
+        return;
+      }
       e.preventDefault(); doCopyToClipboard(); return;
     }
     if (e.key === 'Escape') { cancelCrop(); setTool('select'); return; }
     if (meta && e.key === 'Enter' && cropState) { e.preventDefault(); applyCrop(cropState.box); return; }
     if (!meta && !e.altKey) {
+      // Don't hijack letter keys when the user is interacting with sidebar text
+      // (selecting/highlighting source or translation).
+      if (sidebarSelectionText()) return;
       const map = { v:'select', r:'rect', c:'ellipse', l:'line', a:'arrow', p:'pen', t:'text',
                     n:'label', m:'mosaic', b:'blur', x:'crop' };
       const t = map[e.key.toLowerCase()];
@@ -1044,6 +1117,372 @@
     }
   }
   document.getElementById('btn-save').addEventListener('click', doSave);
+
+  // ---------- Text copy helpers (sidebar selection / per-para buttons) ----------
+  // Returns the non-empty selected text if it lives inside the sidebar; else ''.
+  function sidebarSelectionText() {
+    const sel = window.getSelection && window.getSelection();
+    if (!sel || sel.isCollapsed || sel.rangeCount === 0) return '';
+    const txt = sel.toString();
+    if (!txt) return '';
+    const range = sel.getRangeAt(0);
+    const sidebar = document.getElementById('sidebar');
+    if (!sidebar) return '';
+    // Either endpoint inside #sidebar counts as a sidebar selection.
+    const inSidebar = (node) => sidebar.contains(node.nodeType === 1 ? node : node.parentNode);
+    if (inSidebar(range.startContainer) || inSidebar(range.endContainer)) return txt;
+    return '';
+  }
+
+  // Copy plain text to the system clipboard. Tries the modern API first,
+  // falls back to execCommand('copy') (works in WKWebView even without
+  // the async clipboard permission). Returns true on success.
+  async function copyTextToClipboard(text) {
+    if (!text) return false;
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(text);
+        return true;
+      }
+    } catch (_) { /* fall through */ }
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed'; ta.style.left = '-9999px'; ta.style.top = '0';
+      ta.setAttribute('readonly', '');
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand('copy');
+      document.body.removeChild(ta);
+      return !!ok;
+    } catch (_) { return false; }
+  }
+
+  // ---------- Sidebar select-all + right-click context menu ----------
+  // Find the .para under the cursor (or null if click landed in empty area).
+  function paraAtPoint(x, y) {
+    let el = document.elementFromPoint(x, y);
+    while (el && el !== document.body) {
+      if (el.classList && el.classList.contains('para')) return el;
+      el = el.parentElement;
+    }
+    return null;
+  }
+
+  // Read src/tgt text from a .para element (uses dataset to avoid pulling in
+  // the copy-row button labels via textContent).
+  function paraTexts(el) {
+    if (!el) return { src: '', tgt: '' };
+    const s = el.querySelector('.src');
+    const t = el.querySelector('.tgt');
+    return {
+      src: s ? s.textContent : '',
+      tgt: (t && !el.classList.contains('empty')) ? t.textContent : '',
+    };
+  }
+
+  // Aggregate all paras into joined strings.
+  function allTexts(joiner = '\n\n') {
+    const paras = Array.from(inner.querySelectorAll('.para'));
+    const srcs = [], tgts = [], pairs = [];
+    for (const el of paras) {
+      const { src, tgt } = paraTexts(el);
+      if (src) srcs.push(src);
+      if (tgt) tgts.push(tgt);
+      if (src || tgt) pairs.push([src, tgt].filter(Boolean).join('\n'));
+    }
+    return {
+      src: srcs.join(joiner),
+      tgt: tgts.join(joiner),
+      both: pairs.join(joiner),
+      count: paras.length,
+    };
+  }
+
+  // Programmatically select all text inside the sidebar (one big Range).
+  function selectAllSidebar() {
+    const sel = window.getSelection();
+    if (!sel) return false;
+    sel.removeAllRanges();
+    const range = document.createRange();
+    range.selectNodeContents(inner);
+    sel.addRange(range);
+    return true;
+  }
+
+  // Select just one paragraph's text (covers .src + .tgt, skips copy-row).
+  function selectPara(el) {
+    if (!el) return false;
+    const sel = window.getSelection();
+    if (!sel) return false;
+    sel.removeAllRanges();
+    const range = document.createRange();
+    const s = el.querySelector('.src');
+    const t = el.querySelector('.tgt');
+    const start = s || t;
+    const end = t || s;
+    if (!start) return false;
+    range.setStart(start, 0);
+    range.setEnd(end, end.childNodes.length);
+    sel.addRange(range);
+    return true;
+  }
+
+  // Show the custom context menu. Items: array of {label, shortcut?, action, disabled?, sep?}.
+  const ctxMenu = document.getElementById('ctx-menu');
+  function showCtxMenu(x, y, items) {
+    ctxMenu.innerHTML = '';
+    for (const it of items) {
+      if (it.sep) {
+        const sep = document.createElement('div'); sep.className = 'ctx-sep';
+        ctxMenu.appendChild(sep); continue;
+      }
+      const row = document.createElement('div');
+      row.className = 'ctx-item' + (it.disabled ? ' disabled' : '');
+      row.textContent = it.label;
+      if (it.shortcut) {
+        const sc = document.createElement('span'); sc.className = 'ctx-shortcut';
+        sc.textContent = it.shortcut; row.appendChild(sc);
+      }
+      if (!it.disabled) {
+        row.addEventListener('mousedown', (ev) => ev.preventDefault());
+        row.addEventListener('click', () => { hideCtxMenu(); it.action && it.action(); });
+      }
+      ctxMenu.appendChild(row);
+    }
+    // Pre-place off-screen to measure, then clamp to viewport.
+    ctxMenu.style.left = '-9999px'; ctxMenu.style.top = '-9999px';
+    ctxMenu.classList.add('show');
+    const rect = ctxMenu.getBoundingClientRect();
+    const vw = window.innerWidth, vh = window.innerHeight;
+    let nx = x, ny = y;
+    if (nx + rect.width  > vw - 4) nx = Math.max(4, vw - rect.width  - 4);
+    if (ny + rect.height > vh - 4) ny = Math.max(4, vh - rect.height - 4);
+    ctxMenu.style.left = nx + 'px';
+    ctxMenu.style.top  = ny + 'px';
+  }
+  function hideCtxMenu() { ctxMenu.classList.remove('show'); ctxMenu.innerHTML = ''; }
+  // Auto-dismiss
+  document.addEventListener('mousedown', (e) => {
+    if (ctxMenu.classList.contains('show') && !ctxMenu.contains(e.target)) hideCtxMenu();
+  }, true);
+  window.addEventListener('blur', hideCtxMenu);
+  window.addEventListener('resize', hideCtxMenu);
+  document.addEventListener('scroll', hideCtxMenu, true);
+
+  // ---------- Floating selection toolbar ----------
+  // Returns the .para elements the current selection range intersects.
+  function getSelectedParas() {
+    const sel = window.getSelection();
+    if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return [];
+    const range = sel.getRangeAt(0);
+    return Array.from(inner.querySelectorAll('.para'))
+      .filter(p => { try { return range.intersectsNode(p); } catch (_) { return false; } });
+  }
+
+  // Aggregate text from a list of .para elements (skipping the copy-row hover buttons).
+  function paraListTexts(paras) {
+    const srcs = [], tgts = [], pairs = [];
+    for (const el of paras) {
+      const { src, tgt } = paraTexts(el);
+      if (src) srcs.push(src);
+      if (tgt) tgts.push(tgt);
+      if (src || tgt) pairs.push([src, tgt].filter(Boolean).join('\n'));
+    }
+    return { src: srcs.join('\n\n'), tgt: tgts.join('\n\n'), both: pairs.join('\n\n') };
+  }
+
+  const selBar = document.getElementById('sel-bar');
+  function hideSelBar() { selBar.classList.remove('show'); selBar.innerHTML = ''; }
+
+  function refreshSelBar() {
+    const sel = window.getSelection();
+    if (!sel || sel.isCollapsed || sel.rangeCount === 0) { hideSelBar(); return; }
+    const text = sel.toString();
+    if (!text.trim()) { hideSelBar(); return; }
+    // Only when the selection lives inside the sidebar.
+    const range = sel.getRangeAt(0);
+    const sidebar = document.getElementById('sidebar');
+    const cont = range.commonAncestorContainer;
+    const contEl = cont.nodeType === 1 ? cont : cont.parentNode;
+    if (!sidebar.contains(contEl)) { hideSelBar(); return; }
+
+    const paras = getSelectedParas();
+    const n = paras.length;
+
+    selBar.innerHTML = '';
+
+    // Meta chip (e.g. "2 段 · 87 字")
+    const meta = document.createElement('span'); meta.className = 'sel-meta';
+    meta.textContent = (n > 0 ? n + ' 段 · ' : '') + text.length + ' 字';
+    selBar.appendChild(meta);
+
+    const mkBtn = (label, getText, toastLabel) => {
+      const b = document.createElement('button'); b.textContent = label;
+      // mousedown preventDefault keeps the current selection alive while clicking.
+      b.addEventListener('mousedown', (ev) => ev.preventDefault());
+      b.addEventListener('click', async () => {
+        const t = getText();
+        if (!t) return;
+        const ok = await copyTextToClipboard(t);
+        showToast(ok ? '已复制' + (toastLabel || label) : '复制失败');
+        hideSelBar();
+      });
+      return b;
+    };
+
+    // Always offer the raw selected text.
+    selBar.appendChild(mkBtn('复制选中文本', () => text, '选中文本'));
+
+    if (n === 1) {
+      // Single-paragraph hit → "本段" actions for that paragraph.
+      const { src, tgt } = paraTexts(paras[0]);
+      if (src) selBar.appendChild(mkBtn('复制本段原文', () => src, '本段原文'));
+      if (tgt) selBar.appendChild(mkBtn('复制本段译文', () => tgt, '本段译文'));
+      if (src && tgt) selBar.appendChild(mkBtn('复制本段全部', () => src + '\n' + tgt, '本段'));
+    } else if (n > 1) {
+      // Multi-paragraph hit → operate on every covered paragraph.
+      const t = paraListTexts(paras);
+      if (t.src)  selBar.appendChild(mkBtn(`复制选中 ${n} 段原文`, () => t.src,  `${n} 段原文`));
+      if (t.tgt)  selBar.appendChild(mkBtn(`复制选中 ${n} 段译文`, () => t.tgt,  `${n} 段译文`));
+      if (t.both) selBar.appendChild(mkBtn(`复制选中 ${n} 段全部`, () => t.both, `${n} 段`));
+    }
+
+    // Position above the selection rect; flip below if no room.
+    selBar.style.left = '-9999px'; selBar.style.top = '-9999px';
+    selBar.classList.add('show');
+    const rect = range.getBoundingClientRect();
+    const barRect = selBar.getBoundingClientRect();
+    const vw = window.innerWidth, vh = window.innerHeight;
+    let x = rect.left + (rect.width - barRect.width) / 2;
+    let y = rect.top - barRect.height - 8;
+    if (x < 4) x = 4;
+    if (x + barRect.width > vw - 4) x = Math.max(4, vw - barRect.width - 4);
+    if (y < 4) y = Math.min(vh - barRect.height - 4, rect.bottom + 8);
+    selBar.style.left = x + 'px';
+    selBar.style.top  = y + 'px';
+  }
+
+  // Show the bar after the user finishes selecting (mouseup), regardless of
+  // whether the drag ended inside or outside the sidebar — what matters is
+  // where the resulting selection ended up.
+  document.addEventListener('mouseup', () => {
+    requestAnimationFrame(refreshSelBar);
+  });
+
+  // Drop the bar as soon as the selection collapses (typing, click, etc.).
+  document.addEventListener('selectionchange', () => {
+    const sel = window.getSelection();
+    if (!sel || sel.isCollapsed || !sel.toString().trim()) hideSelBar();
+  });
+
+  // Click outside the bar starts a new selection — hide the old bar; mouseup
+  // will re-create it if a fresh selection lands.
+  document.addEventListener('mousedown', (e) => {
+    if (selBar.classList.contains('show') && !selBar.contains(e.target)) hideSelBar();
+  }, true);
+  window.addEventListener('blur', hideSelBar);
+  window.addEventListener('resize', hideSelBar);
+  document.addEventListener('scroll', hideSelBar, true);
+
+  // Hook up: right-click anywhere inside #sidebar.
+  document.getElementById('sidebar').addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    const para = paraAtPoint(e.clientX, e.clientY);
+    const sel = sidebarSelectionText();
+    const all = allTexts();
+    const has = (s) => !!(s && s.trim());
+    const items = [];
+
+    if (sel) {
+      items.push({
+        label: '复制选中文本', shortcut: '⌘C',
+        action: async () => {
+          const ok = await copyTextToClipboard(sel);
+          showToast(ok ? '已复制选中文本' : '复制失败');
+        }
+      });
+      items.push({ sep: true });
+    }
+
+    if (para) {
+      const { src, tgt } = paraTexts(para);
+      items.push({
+        label: '复制本段原文', disabled: !has(src),
+        action: async () => {
+          const ok = await copyTextToClipboard(src);
+          showToast(ok ? '已复制本段原文' : '复制失败');
+        }
+      });
+      items.push({
+        label: '复制本段译文', disabled: !has(tgt),
+        action: async () => {
+          const ok = await copyTextToClipboard(tgt);
+          showToast(ok ? '已复制本段译文' : '复制失败');
+        }
+      });
+      items.push({
+        label: '复制本段全部', disabled: !has(src) && !has(tgt),
+        action: async () => {
+          const text = [src, tgt].filter(has).join('\n');
+          const ok = await copyTextToClipboard(text);
+          showToast(ok ? '已复制本段' : '复制失败');
+        }
+      });
+      items.push({ sep: true });
+    }
+
+    items.push({
+      label: '复制全部原文', disabled: !has(all.src),
+      action: async () => {
+        const ok = await copyTextToClipboard(all.src);
+        showToast(ok ? '已复制全部原文' : '复制失败');
+      }
+    });
+    items.push({
+      label: '复制全部译文', disabled: !has(all.tgt),
+      action: async () => {
+        const ok = await copyTextToClipboard(all.tgt);
+        showToast(ok ? '已复制全部译文' : '复制失败');
+      }
+    });
+    items.push({
+      label: '复制全部原文+译文', disabled: !has(all.both),
+      action: async () => {
+        const ok = await copyTextToClipboard(all.both);
+        showToast(ok ? '已复制全部原文+译文' : '复制失败');
+      }
+    });
+    items.push({ sep: true });
+    items.push({
+      label: para ? '选中本段' : '全选',
+      shortcut: para ? '' : '⌘A',
+      action: () => { para ? selectPara(para) : selectAllSidebar(); }
+    });
+    if (para) {
+      items.push({ label: '全选侧栏', shortcut: '⌘A', action: () => selectAllSidebar() });
+    }
+
+    showCtxMenu(e.clientX, e.clientY, items);
+  });
+
+  // ⌘A: select all sidebar text when the cursor is over the sidebar
+  // (or there's already a selection inside it). Otherwise leave alone.
+  let pointerInSidebar = false;
+  const sidebarEl = document.getElementById('sidebar');
+  sidebarEl.addEventListener('mouseenter', () => { pointerInSidebar = true; });
+  sidebarEl.addEventListener('mouseleave', () => { pointerInSidebar = false; });
+  window.addEventListener('keydown', (e) => {
+    if (!(e.metaKey || e.ctrlKey)) return;
+    if (e.key.toLowerCase() !== 'a') return;
+    if (document.activeElement && /input|textarea/i.test(document.activeElement.tagName)) return;
+    if (pointerInSidebar || sidebarSelectionText()) {
+      e.preventDefault();
+      e.stopPropagation();
+      selectAllSidebar();
+      requestAnimationFrame(refreshSelBar);
+    }
+  }, true); // capture phase: beats Konva / other listeners
 
   // ---------- Copy to clipboard (image + annotations, no translation) ----------
   async function doCopyToClipboard() {
