@@ -46,14 +46,20 @@ pip3 install pywebview argostranslate rumps pynput \
     pyobjc-framework-Cocoa 2>&1 | tail -5
 echo "[OK] Dependencies installed"
 
-# 下载语言包
+# 下载 argos 语言包（兜底翻译引擎）
 echo ""
-echo "[INFO] Downloading language packs (this may take a few minutes)..."
-python3 -c "
+echo "[INFO] Downloading argos language packs (this may take a few minutes)..."
+ARGOS_COUNT=$(python3 - <<'PYEOF'
 import argostranslate.package as pkg
+import sys
 
-pkg.update_package_index()
-available = pkg.get_available_packages()
+try:
+    pkg.update_package_index()
+    available = pkg.get_available_packages()
+except Exception as e:
+    print(f"  [ERROR] update_package_index failed: {e}", file=sys.stderr)
+    print(0)
+    sys.exit(0)
 
 pairs = [
     ('en','zh'), ('zh','en'),
@@ -68,18 +74,72 @@ pairs = [
     ('en','ar'), ('ar','en'),
 ]
 
-installed = 0
+# 已安装的跳过，避免重复下载。
+installed_pairs = {(p.from_code, p.to_code) for p in pkg.get_installed_packages()}
+ok = len(installed_pairs)
+
 for src, tgt in pairs:
+    if (src, tgt) in installed_pairs:
+        continue
+    matched = None
     for p in available:
         if p.from_code == src and p.to_code == tgt:
-            print(f'  Downloading {src} -> {tgt}...')
-            pkg.install_from_path(p.download())
-            installed += 1
+            matched = p
             break
+    if matched is None:
+        print(f"  [WARN] no package for {src} -> {tgt}", file=sys.stderr)
+        continue
+    try:
+        print(f"  Downloading {src} -> {tgt}...", file=sys.stderr)
+        pkg.install_from_path(matched.download())
+        ok += 1
+    except Exception as e:
+        print(f"  [WARN] download failed {src} -> {tgt}: {e}", file=sys.stderr)
 
-print(f'  Done. {installed} language packs installed.')
-"
-echo "[OK] Language packs ready"
+# 最后一行 stdout 是计数，给 shell 读
+print(ok)
+PYEOF
+)
+
+if [[ -z "$ARGOS_COUNT" || "$ARGOS_COUNT" -lt 1 ]]; then
+    echo "[ERROR] argos language packs failed to install (0 packs)."
+    echo "        网络/代理问题导致下载失败。请检查 https://www.argosopentech.com 可访问后重跑。"
+    exit 1
+fi
+echo "[OK] argos language packs ready ($ARGOS_COUNT pairs)"
+
+# ===== Swift 高质量翻译桥（macOS 15+，可选） =====
+if [[ "$(uname)" == "Darwin" ]]; then
+    SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+    MACOS_MAJOR=$(sw_vers -productVersion | cut -d. -f1)
+    echo ""
+    if [[ "$MACOS_MAJOR" -ge 15 ]]; then
+        if command -v swiftc &>/dev/null; then
+            echo "[INFO] Building Apple Translation bridge (swift translator-helper)..."
+            (
+                cd "$SCRIPT_DIR/swift"
+                if swiftc -O -parse-as-library -o translator-helper translator_helper.swift 2>&1; then
+                    echo "[OK] Built swift/translator-helper"
+                else
+                    echo "[WARN] translator-helper 编译失败，翻译会回退到 argos（速度/质量较低）"
+                fi
+                if swiftc -O -parse-as-library -o probe-prepare probe_prepare.swift 2>&1; then
+                    mkdir -p TranslatorPrepare.app/Contents/MacOS
+                    cp probe-prepare TranslatorPrepare.app/Contents/MacOS/TranslatorPrepare
+                    echo "[OK] Built swift/TranslatorPrepare.app (Apple 语言包下载器)"
+                else
+                    echo "[WARN] TranslatorPrepare.app 编译失败，Apple 语言包需要手动通过系统设置下载"
+                fi
+            )
+        else
+            echo "[WARN] 未检测到 swiftc。Apple Translation framework 桥跳过编译。"
+            echo "       装 Xcode Command Line Tools 后重跑 install.sh 即可启用："
+            echo "         xcode-select --install"
+        fi
+    else
+        echo "[INFO] macOS $MACOS_MAJOR < 15，跳过 Apple Translation framework 桥（仅 argos 可用）"
+    fi
+fi
 
 # macOS: 创建 .app
 if [[ "$(uname)" == "Darwin" ]]; then
@@ -245,13 +305,36 @@ while true; do
     fi
 done
 
+SCRIPT_DIR_FINAL="$(cd "$(dirname "$0")" && pwd)"
+
+# ===== Apple 语言包下载引导（macOS 15+） =====
+PREPARE_APP="$SCRIPT_DIR_FINAL/swift/TranslatorPrepare.app"
+if [[ "$(uname)" == "Darwin" ]] && [[ -x "$PREPARE_APP/Contents/MacOS/TranslatorPrepare" ]]; then
+    echo ""
+    echo "========================================="
+    echo "  Apple Translation 语言包（强烈推荐）"
+    echo "========================================="
+    echo ""
+    echo "  现在打开 TranslatorPrepare.app，会弹 4 个系统对话框（中/英/日/韩），"
+    echo "  每个点「下载」即可。装完翻译速度 5-8s → 60-120ms，质量也明显提升。"
+    echo ""
+    printf "  现在打开吗？[Y/n]: "
+    read prep_open
+    prep_open_lower=$(echo "${prep_open:-y}" | tr '[:upper:]' '[:lower:]' | tr -d ' ')
+    if [[ "$prep_open_lower" != "n" && "$prep_open_lower" != "no" ]]; then
+        open "$PREPARE_APP"
+        echo "  [OK] 已打开。装完 4 个语言包后关掉它即可。"
+    else
+        echo "  跳过。之后想装：双击 $PREPARE_APP"
+    fi
+fi
+
 echo ""
 echo "========================================="
 echo "  Installation complete!"
 echo "========================================="
 echo ""
 echo "  Usage:"
-SCRIPT_DIR_FINAL="$(cd "$(dirname "$0")" && pwd)"
 echo "    Translator window:   python3 $SCRIPT_DIR_FINAL/app.py"
 echo "    Select-to-translate:  python3 $SCRIPT_DIR_FINAL/daemon.py"
 if [[ "$(uname)" == "Darwin" ]]; then

@@ -9,7 +9,7 @@ Architecture (slim daemon, 2026-04-28):
     on macOS 26 + py2app for reasons we never fully untangled (PyObjC bridge
     + system framework + py2app bundle interaction). Keeping them out of the
     daemon = daemon stays alive.
-  - ⌃⌥A → spawn `--worker` one-shot subprocess. Worker does:
+  - ⌃⌥A → wake/spawn a worker subprocess. Worker does:
         capture overlay → OCR → translate → spawn editor → os._exit(0)
     Worker dies after every screenshot. If the worker crashes, the daemon
     is unaffected.
@@ -19,10 +19,12 @@ Architecture (slim daemon, 2026-04-28):
 
 import json
 import os
+import select
 import subprocess
 import sys
 import threading
 import time
+import types as _types
 
 # Lightweight diagnostic hooks. Keep them — they cost nothing and help us
 # spot residual exits if anything ever goes wrong.
@@ -65,7 +67,6 @@ if _IS_SUBPROCESS:
     # actually loading the heavy deps. The class is never *instantiated* in
     # subprocess mode (main block dispatches to _run_worker / _run_subapp /
     # etc. before reaching the daemon path).
-    import types as _types
     rumps = _types.SimpleNamespace(
         App=object,
         MenuItem=lambda *a, **kw: None,
@@ -84,19 +85,30 @@ if _IS_SUBPROCESS:
 else:
     import rumps
     from pynput import keyboard
-    import argostranslate.translate
-    import argostranslate.package
+    # Loaded lazily only if Apple Translation cannot handle a selected-text
+    # request. Importing argostranslate can pull stanza/torch into the daemon,
+    # making the menubar process heavy even while idle.
+    argostranslate = None
 
-from AppKit import (
-    NSPanel, NSMakeRect, NSBackingStoreBuffered,
-    NSScreen, NSEvent, NSTextField, NSFont, NSColor, NSView,
-)
-from PyObjCTools.AppHelper import callAfter
+if _IS_SUBPROCESS:
+    NSPanel = NSMakeRect = NSBackingStoreBuffered = None
+    NSScreen = NSEvent = NSTextField = NSFont = NSColor = NSView = None
 
-try:
-    from ApplicationServices import AXIsProcessTrusted
-except ImportError:
+    def callAfter(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
     AXIsProcessTrusted = None
+else:
+    from AppKit import (
+        NSPanel, NSMakeRect, NSBackingStoreBuffered,
+        NSScreen, NSEvent, NSTextField, NSFont, NSColor, NSView,
+    )
+    from PyObjCTools.AppHelper import callAfter
+
+    try:
+        from ApplicationServices import AXIsProcessTrusted
+    except ImportError:
+        AXIsProcessTrusted = None
 
 DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -108,6 +120,18 @@ def _resource_dir() -> str:
 
 RESOURCES = _resource_dir()
 IS_BUNDLE = bool(os.environ.get("RESOURCEPATH"))
+
+
+def _ensure_argostranslate():
+    """Lazy-load argostranslate for daemon fallback translation."""
+    global argostranslate
+    if argostranslate is None:
+        import importlib
+        argostranslate = _types.SimpleNamespace(
+            translate=importlib.import_module("argostranslate.translate"),
+            package=importlib.import_module("argostranslate.package"),
+        )
+    return argostranslate
 
 
 def _spawn_subapp(extra_argv, log_path: str):
@@ -170,11 +194,17 @@ class TranslatorDaemon(rumps.App):
         self.panel = None
         # Hot worker pool: a primed --hot-worker subprocess that has already
         # imported the heavy stack and is blocking on stdin.readline().
-        # ⌃⌥A writes "GO\n" to it; daemon spawns a replacement immediately.
+        # ⌃⌥A writes "GO\n" to it; daemon primes a replacement after the
+        # consumed worker exits so memory doesn't spike from overlapping workers.
         self._hot_proc = None
         self._hot_ready = False
         self._hot_lock = threading.Lock()
         self._hot_respawn_inflight = False
+        self._hot_enabled = os.environ.get("LT_HOT_WORKER", "1").lower() not in {"0", "false", "no", "off"}
+        # Keep idle memory bounded. A hot worker is useful right after launch
+        # and after captures, but leaving torch/argos warm forever costs a few
+        # hundred MB for a shortcut the user may not press again for hours.
+        self._hot_idle_timeout_s = float(os.environ.get("LT_HOT_WORKER_IDLE_TIMEOUT", "180"))
         # Anti-spam: ignore ⌃⌥A presses that arrive too soon after the
         # previous trigger (overlay hasn't appeared yet → user thinks the
         # hotkey didn't register and mashes it, then multiple overlays
@@ -219,7 +249,8 @@ class TranslatorDaemon(rumps.App):
         # Prime the first hot worker after rumps finishes bootstrapping.
         # callAfter defers it onto the main runloop; the actual subprocess
         # spawn + pipe IO are done from a background thread inside.
-        callAfter(self._spawn_hot_worker)
+        if self._hot_enabled:
+            callAfter(self._spawn_hot_worker)
 
     def _start_hotkey(self):
         """Start global hotkey listener in background thread."""
@@ -270,14 +301,21 @@ class TranslatorDaemon(rumps.App):
                 self._hot_proc = None
                 self._hot_ready = False
                 used_hot = True
+            elif proc is not None and proc.poll() is not None:
+                self._hot_proc = None
+                self._hot_ready = False
 
         if used_hot:
             try:
                 proc.stdin.write("GO\n")
                 proc.stdin.flush()
                 self._log_hot(f"GO sent to pid={proc.pid}")
-                # Replenish the pool so the next hotkey is also fast.
-                self._spawn_hot_worker()
+                # Replenish only after the consumed worker exits. Spawning the
+                # replacement immediately overlaps two heavy workers plus the
+                # editor WebView, which creates avoidable memory spikes.
+                threading.Thread(
+                    target=self._reprime_after_worker, args=(proc,), daemon=True
+                ).start()
                 return
             except Exception as e:
                 # Pipe broken between READY and now (rare). Fall through.
@@ -286,7 +324,7 @@ class TranslatorDaemon(rumps.App):
         # Cold fallback. Also try to (re-)prime the pool if it's empty.
         self._spawn_cold_worker()
         with self._hot_lock:
-            need_prime = self._hot_proc is None and not self._hot_respawn_inflight
+            need_prime = self._hot_enabled and self._hot_proc is None and not self._hot_respawn_inflight
         if need_prime:
             self._spawn_hot_worker()
 
@@ -310,6 +348,8 @@ class TranslatorDaemon(rumps.App):
     def _spawn_hot_worker(self):
         """Spawn a --hot-worker subprocess and start a background thread that
         flips _hot_ready to True when the worker writes READY to stdout."""
+        if not self._hot_enabled:
+            return
         with self._hot_lock:
             if self._hot_respawn_inflight:
                 return
@@ -333,7 +373,7 @@ class TranslatorDaemon(rumps.App):
                 encoding="utf-8",
                 errors="replace",
             )
-            self._log_hot(f"spawned pid={proc.pid}")
+            self._log_hot(f"spawned pid={proc.pid} idle_timeout={self._hot_idle_timeout_s:.0f}s")
         except Exception as e:
             self._log_hot(f"spawn failed: {e}")
             with self._hot_lock:
@@ -348,6 +388,19 @@ class TranslatorDaemon(rumps.App):
         threading.Thread(
             target=self._await_hot_ready, args=(proc,), daemon=True
         ).start()
+
+    def _reprime_after_worker(self, proc):
+        """Wait for a used hot worker to finish before priming the next one."""
+        try:
+            proc.wait(timeout=180)
+        except subprocess.TimeoutExpired:
+            self._log_hot(f"worker pid={proc.pid} still running after timeout; skip reprime")
+            return
+        except Exception as e:
+            self._log_hot(f"wait failed pid={getattr(proc, 'pid', '?')}: {e}")
+            return
+        self._log_hot(f"worker pid={proc.pid} exited; reprime")
+        self._spawn_hot_worker()
 
     def _await_hot_ready(self, proc):
         """Background thread: read worker stdout until READY (or EOF)."""
@@ -371,6 +424,15 @@ class TranslatorDaemon(rumps.App):
                 if self._hot_proc is proc:
                     self._hot_ready = True
                     self._log_hot(f"worker pid={proc.pid} READY")
+            try:
+                proc.wait()
+            except Exception:
+                return
+            with self._hot_lock:
+                if self._hot_proc is proc:
+                    self._hot_proc = None
+                    self._hot_ready = False
+                    self._log_hot(f"worker pid={proc.pid} exited while idle")
         else:
             self._log_hot(f"worker pid={proc.pid} unexpected stdout: {line!r}")
 
@@ -507,7 +569,8 @@ class TranslatorDaemon(rumps.App):
 
         # 2) argostranslate fallback with English pivot.
         try:
-            installed = argostranslate.translate.get_installed_languages()
+            at = _ensure_argostranslate()
+            installed = at.translate.get_installed_languages()
             lm = {lang.code: lang for lang in installed}
             src = lm.get(src_code)
             tgt = lm.get(tgt_code)
@@ -870,6 +933,12 @@ def _run_hot_worker():
     except Exception:
         os._exit(1)
     try:
+        idle_timeout = float(os.environ.get("LT_HOT_WORKER_IDLE_TIMEOUT", "180"))
+        if idle_timeout > 0:
+            ready, _, _ = select.select([sys.stdin], [], [], idle_timeout)
+            if not ready:
+                _log(f"idle timeout after {idle_timeout:.0f}s; exiting")
+                os._exit(0)
         line = sys.stdin.readline()
     except Exception:
         os._exit(1)

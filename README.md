@@ -35,15 +35,26 @@ macOS 截图翻译 + 编辑 + 画廊管理工具。全程离线，不上传任�
 
 ### 用法 B — 从源码跑（开发者）
 
+前置：macOS 15+ 建议先装 Xcode Command Line Tools（`xcode-select --install`），install.sh 会自动用 `swiftc` 编译 Apple Translation 桥。没有也能跑，只是只剩 argos 兜底引擎。
+
 ```bash
 cd translator
-bash install.sh        # 装 Python 依赖 + argos 模型
+bash install.sh        # 装 Python 依赖 + argos 模型 + 编译 swift 桥 + 引导下载 Apple 语言包
 python3 daemon.py      # 启动菜单栏 daemon
 ```
 
+install.sh 会依次做：
+
+1. 装 Python 依赖（pywebview / argostranslate / rumps / pynput / pyobjc）
+2. 下载 argos 兜底语言包（≥1 个，0 个会直接报错退出，避免静默失败）
+3. macOS 15+：`swiftc` 编译 `swift/translator-helper` 和 `swift/TranslatorPrepare.app`
+4. `osacompile` 生成 `Local Translator.app` / `Translate Daemon.app`
+5. 装右键服务菜单
+6. 结尾弹 Y/n 提示「现在打开 TranslatorPrepare.app 装 Apple 语言包吗？」—— 强烈选 Y
+
 ## 翻译质量升级（首次必看）
 
-默认装上后 Apple Translation framework 的语言包是空的，会一直走 argos（质量一般）。装语言包：
+默认装上后 Apple Translation framework 的语言包是空的，会一直走 argos（质量一般）。**用法 B 的 install.sh 结尾已经会主动提示打开** TranslatorPrepare.app，照做即可；**用法 A（.dmg）** 的用户需要手动打开下面这个 app：
 
 1. 在 `Local Translator.app/Contents/Resources/swift/` 下找到 **TranslatorPrepare.app**，双击。
 2. 弹窗依次提示下载 **中文** + **英文** + **日文** + **韩文**，每个对话框都点 **下载**。
@@ -52,6 +63,7 @@ python3 daemon.py      # 启动菜单栏 daemon
 之后再翻译，状态栏弹窗的速度会从 5-8 秒降到 60-120ms，质量肉眼可见提升。
 
 > 备注：Apple Translation 的语言包统一在 *系统设置 → 通用 → 语言与地区 → 翻译语言* 管理，所有 App 共享。
+> 如果 install.sh 跑的时候漏点了引导，事后直接 `open swift/TranslatorPrepare.app` 也行。
 
 ## 使用
 
@@ -85,14 +97,34 @@ rm -rf ~/Library/Application\ Support/LocalTranslator
 - **应用体积 ~1.1GB**：argos 把 stanza/torch 整个拖进来了；后续会瘦身。
 - **画廊裁剪不可撤销**：撤销栈只记录注释节点。
 - **日韩翻译质量**：`ja→zh` / `ko→zh` 需要在 TranslatorPrepare.app 里把日语和韩语包也下了，否则走 argos。
-- **首次冷启动**：daemon 启动后约 5 秒内完成 hot worker 预热；这段时间按 ⌃⌥A 会回退到冷启动路径（~3-5s）。日常使用启动等一下再用即可。
+- **首次冷启动**：daemon 启动后约 5 秒内完成 hot worker 预热；这段时间按 ⌃⌥A 会回退到冷启动路径（~3-5s）。hot worker 空闲 180 秒会自动退出以释放内存，下一次截图会重新预热。
+
+## 性能 / 内存调节
+
+默认配置偏向热键响应速度，同时会控制长期空闲内存：
+
+```bash
+python3 daemon.py
+```
+
+省内存优先：关闭 hot worker，截图翻译每次走冷启动路径。
+
+```bash
+LT_HOT_WORKER=0 python3 daemon.py
+```
+
+调短 hot worker 空闲释放时间，例如 60 秒：
+
+```bash
+LT_HOT_WORKER_IDLE_TIMEOUT=60 python3 daemon.py
+```
 
 ## v1.3.3 架构亮点（性能）
 
 为了把 ⌃⌥A 到译文显示的端到端延迟从 8-9 秒压到 ~2 秒，做了四件事：
 
-1. **Hot worker 池**：daemon 启动后预生一个常驻子进程，已 import 完 torch/argos 在 stdin 上沉睡；⌃⌥A 时通过 pipe 唤醒它直接干活，省掉冷启动的 3-5 秒。
-2. **Editor 早开 + 后台 hydrate**：截图完毕立即弹出编辑器（左截图 + 右栏 spinner），OCR 与翻译在后台并行，结果就绪后 editor 通过 500ms 轮询拿到译文替换 spinner。
+1. **Hot worker 池**：daemon 启动后预生一个子进程，已 import 完 torch/argos 在 stdin 上沉睡；⌃⌥A 时通过 pipe 唤醒它直接干活，省掉冷启动的 3-5 秒。worker 用完后再补位，空闲超时自动退出，避免长期占用和峰值叠加。
+2. **Editor 早开 + 后台 hydrate**：截图完毕立即弹出编辑器（左截图 + 右栏 spinner），OCR 与翻译在后台并行，结果就绪后 worker 写入结果文件，editor watcher 推送到 WebView 并替换 spinner。
 3. **Subprocess 模式跳过 daemon-only 依赖**：worker / editor / gallery 子进程不再 import rumps / pynput / argostranslate（顶部按 sys.argv 条件加载），单进程冷启动从 4s 降到 1s。
 4. **Konva.js 本地化**：编辑器从 unpkg CDN 加载 Konva 改为打包内 `ui/vendor/konva.min.js`，省去每次 3-4 秒的 DNS+TLS+下载。
 
