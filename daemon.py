@@ -59,7 +59,8 @@ atexit.register(_atexit_dump)
 # which costs ~3-4 seconds of cold start on the editor subprocess. Stubbing
 # them out for subprocess mode shaves that off.
 _SUBPROCESS_FLAGS = {"--worker", "--hot-worker", "--gallery", "--capture",
-                     "--from-meta", "--from-result", "--from-image"}
+                     "--from-meta", "--from-result", "--from-image",
+                     "--install-argos"}
 _IS_SUBPROCESS = (len(sys.argv) > 1 and sys.argv[1] in _SUBPROCESS_FLAGS)
 
 if _IS_SUBPROCESS:
@@ -101,7 +102,7 @@ if _IS_SUBPROCESS:
 else:
     from AppKit import (
         NSPanel, NSMakeRect, NSBackingStoreBuffered,
-        NSScreen, NSEvent, NSTextField, NSFont, NSColor, NSView,
+        NSScreen, NSEvent, NSTextField, NSFont, NSColor, NSView, NSButton,
     )
     from PyObjCTools.AppHelper import callAfter
 
@@ -159,7 +160,21 @@ LANG_NAMES = {
     "ru": "RU", "it": "IT", "ar": "AR",
 }
 
-# User preferences (target language for ⌘⇧Y) — persisted across launches.
+ARGOS_REQUIRED_PAIRS = [
+    ("en", "zh"), ("zh", "en"),
+    ("en", "ja"), ("ja", "en"),
+    ("en", "ko"), ("ko", "en"),
+    ("en", "fr"), ("fr", "en"),
+    ("en", "de"), ("de", "en"),
+    ("en", "es"), ("es", "en"),
+    ("en", "ru"), ("ru", "en"),
+    ("en", "pt"), ("pt", "en"),
+    ("en", "it"), ("it", "en"),
+    ("en", "ar"), ("ar", "en"),
+]
+
+# User preferences (target language for text selection + screenshot flows) —
+# persisted across launches and re-read by capture workers at translation time.
 _PREFS_DIR = os.path.expanduser("~/Library/Application Support/LocalTranslator")
 _PREFS_PATH = os.path.join(_PREFS_DIR, "prefs.json")
 TARGET_LANG_OPTIONS = [
@@ -169,6 +184,7 @@ TARGET_LANG_OPTIONS = [
     ("ja", "日文"),
     ("ko", "韩文"),
 ]
+_TARGET_LANG_CODES = {code for code, _label in TARGET_LANG_OPTIONS}
 
 
 def _load_prefs() -> dict:
@@ -188,10 +204,39 @@ def _save_prefs(prefs: dict) -> None:
         pass
 
 
+def _target_pref(prefs=None) -> str:
+    target = (prefs or _load_prefs()).get("target_lang", "auto")
+    return target if target in _TARGET_LANG_CODES else "auto"
+
+
+def _detect_src_text(text: str) -> str:
+    """Detect the source language from a sample of the text."""
+    if any("぀" <= c <= "ゟ" or "゠" <= c <= "ヿ" for c in text):
+        return "ja"
+    if any("가" <= c <= "힯" for c in text):
+        return "ko"
+    if any("一" <= c <= "鿿" for c in text):
+        return "zh"
+    return "en"
+
+
+def _pick_langs_for_text(text: str, target_pref=None):
+    """Pick (src, tgt) using the same rules for selected text and screenshots."""
+    src = _detect_src_text(text)
+    target = target_pref if target_pref in _TARGET_LANG_CODES else _target_pref()
+    if target == "auto":
+        return (src, "en") if src == "zh" else (src, "zh")
+    if target == src:
+        # Avoid same→same: pick the most useful alternative.
+        return (src, "en") if src != "en" else (src, "zh")
+    return src, target
+
+
 class TranslatorDaemon(rumps.App):
     def __init__(self):
         super().__init__("译", quit_button=None)
         self.panel = None
+        self.onboarding_panel = None
         # Hot worker pool: a primed --hot-worker subprocess that has already
         # imported the heavy stack and is blocking on stdin.readline().
         # ⌃⌥A writes "GO\n" to it; daemon primes a replacement after the
@@ -224,11 +269,17 @@ class TranslatorDaemon(rumps.App):
             self._target_items[code] = item
 
         self.menu = [
-            rumps.MenuItem("截图翻译 ⌃⌥A", callback=self._on_capture_menu),
-            rumps.MenuItem("选中翻译 ⌘⇧Y", callback=self._show_usage),
+            rumps.MenuItem("① 下载/检查语言包", callback=self._open_language_setup),
+            rumps.MenuItem("② 授权辅助功能（全局热键）", callback=self._open_accessibility_settings),
+            rumps.MenuItem("③ 授权输入监控（选中文字）", callback=self._open_input_monitoring_settings),
+            rumps.MenuItem("④ 授权屏幕录制（截图翻译）", callback=self._open_screen_recording_settings),
+            None,
+            rumps.MenuItem("⑤ 截图翻译 ⌃⌥A", callback=self._on_capture_menu),
+            rumps.MenuItem("⑥ 选中文字翻译 ⌘⇧Y", callback=self._show_usage),
+            None,
             rumps.MenuItem("打开翻译器", callback=self._open_translator),
             rumps.MenuItem("打开画廊", callback=self._open_gallery),
-            None,
+            rumps.MenuItem("新手引导 / 安装步骤", callback=self._show_onboarding),
             target_submenu,
             None,
             rumps.MenuItem("退出", callback=rumps.quit_application),
@@ -251,6 +302,7 @@ class TranslatorDaemon(rumps.App):
         # spawn + pipe IO are done from a background thread inside.
         if self._hot_enabled:
             callAfter(self._spawn_hot_worker)
+        callAfter(self._maybe_show_onboarding)
 
     def _start_hotkey(self):
         """Start global hotkey listener in background thread."""
@@ -515,13 +567,7 @@ class TranslatorDaemon(rumps.App):
 
     def _detect_src(self, text) -> str:
         """Detect the source language from a sample of the text."""
-        if any("぀" <= c <= "ゟ" or "゠" <= c <= "ヿ" for c in text):
-            return "ja"
-        if any("가" <= c <= "힯" for c in text):
-            return "ko"
-        if any("一" <= c <= "鿿" for c in text):
-            return "zh"
-        return "en"
+        return _detect_src_text(text)
 
     def _detect(self, text):
         """Pick (src, tgt). Source is detected from the text; target follows
@@ -530,14 +576,7 @@ class TranslatorDaemon(rumps.App):
         detected source (e.g. user picked 中文 but selection is already
         Chinese), we flip to a sensible secondary so the translation isn't
         a no-op."""
-        src = self._detect_src(text)
-        target = self.prefs.get("target_lang", "auto")
-        if target == "auto":
-            return (src, "en") if src == "zh" else (src, "zh")
-        if target == src:
-            # Avoid same→same: pick the most useful alternative.
-            return (src, "en") if src != "en" else (src, "zh")
-        return src, target
+        return _pick_langs_for_text(text, _target_pref(self.prefs))
 
     def _translate(self, text, src_code, tgt_code):
         """Translate selected text. Apple translator-helper first (high
@@ -605,6 +644,122 @@ class TranslatorDaemon(rumps.App):
             if os.path.isfile(cand) and os.access(cand, os.X_OK):
                 return cand
         return None
+
+    def _prepare_app_path(self):
+        """Bundled Apple Translation language-pack downloader, if present."""
+        candidates = (
+            os.path.join(RESOURCES, "swift", "TranslatorPrepare.app"),
+            os.path.join(DIR, "swift", "TranslatorPrepare.app"),
+        )
+        for cand in candidates:
+            exe = os.path.join(cand, "Contents", "MacOS", "TranslatorPrepare")
+            if os.path.isdir(cand) and os.path.isfile(exe):
+                return cand
+        return None
+
+    def _has_any_apple_language_pack(self) -> bool:
+        helper = self._helper_bin()
+        if not helper:
+            return False
+        try:
+            out = subprocess.run(
+                [helper, "--check"],
+                capture_output=True, text=True, timeout=5,
+                encoding="utf-8", errors="replace",
+            ).stdout.strip()
+            data = json.loads(out)
+            pairs = data.get("pairs", {})
+            return any(v == "installed" for v in pairs.values())
+        except Exception:
+            return False
+
+    def _label(self, text: str, x: int, y: int, w: int, h: int, size: int = 13, color=None):
+        f = NSTextField.alloc().initWithFrame_(NSMakeRect(x, y, w, h))
+        f.setStringValue_(text)
+        f.setEditable_(False)
+        f.setBezeled_(False)
+        f.setDrawsBackground_(False)
+        f.setSelectable_(False)
+        f.setFont_(NSFont.systemFontOfSize_(size))
+        if color is not None:
+            f.setTextColor_(color)
+        try:
+            f.cell().setWraps_(True)
+            f.cell().setScrollable_(False)
+        except Exception:
+            pass
+        return f
+
+    def _button(self, title: str, x: int, y: int, w: int, action: str):
+        b = NSButton.alloc().initWithFrame_(NSMakeRect(x, y, w, 32))
+        b.setTitle_(title)
+        b.setBezelStyle_(1)
+        b.setTarget_(self)
+        b.setAction_(action)
+        return b
+
+    def _maybe_show_onboarding(self):
+        if self.prefs.get("onboarding_seen"):
+            return
+        self._show_onboarding(None)
+
+    def _show_onboarding(self, _):
+        if self.onboarding_panel:
+            self.onboarding_panel.close()
+
+        W, H = 520, 340
+        sf = NSScreen.mainScreen().visibleFrame()
+        x = sf.origin.x + (sf.size.width - W) / 2
+        y = sf.origin.y + (sf.size.height - H) / 2
+
+        self.onboarding_panel = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
+            NSMakeRect(x, y, W, H),
+            1 | 2 | 128,
+            NSBackingStoreBuffered,
+            False,
+        )
+        self.onboarding_panel.setTitle_("Local Translator 新手引导")
+        self.onboarding_panel.setLevel_(25)
+        self.onboarding_panel.setHidesOnDeactivate_(False)
+        self.onboarding_panel.setBecomesKeyOnlyIfNeeded_(True)
+
+        cv = self.onboarding_panel.contentView()
+        cv.addSubview_(self._label("Local Translator 已启动", 28, 292, W - 56, 28, 20))
+        cv.addSubview_(self._label(
+            "请看屏幕右上角菜单栏里的「译」图标，然后按菜单里的编号一步步操作。",
+            28, 254, W - 56, 42, 13, NSColor.secondaryLabelColor(),
+        ))
+
+        sep = NSView.alloc().initWithFrame_(NSMakeRect(28, 242, W - 56, 1))
+        sep.setWantsLayer_(True)
+        sep.layer().setBackgroundColor_(NSColor.separatorColor().CGColor())
+        cv.addSubview_(sep)
+
+        cv.addSubview_(self._label("菜单里的使用顺序是：", 28, 210, W - 56, 20, 13))
+        steps = (
+            "① 下载/检查语言包\n"
+            "② 授权辅助功能（全局热键）\n"
+            "③ 授权输入监控（选中文字）\n"
+            "④ 授权屏幕录制（截图翻译）\n"
+            "⑤ 截图翻译 ⌃⌥A / ⑥ 选中文字翻译 ⌘⇧Y"
+        )
+        cv.addSubview_(self._label(steps, 44, 106, W - 88, 104, 13, NSColor.labelColor()))
+        cv.addSubview_(self._label(
+            "这个窗口只做提示；真正的下载和授权都请从右上角「译」菜单进入。",
+            28, 70, W - 56, 22, 12, NSColor.secondaryLabelColor(),
+        ))
+
+        cv.addSubview_(self._button("我知道了", W - 118, 26, 90, "onboardingDismiss:"))
+
+        self.onboarding_panel.orderFrontRegardless()
+
+    def onboardingDismiss_(self, _sender):
+        self.prefs["onboarding_seen"] = True
+        self.prefs["language_setup_prompted"] = True
+        _save_prefs(self.prefs)
+        if self.onboarding_panel:
+            self.onboarding_panel.close()
+            self.onboarding_panel = None
 
     def _show_popup(self, original, translated, src, tgt, hint: str = ""):
         """Show native floating panel near the mouse cursor."""
@@ -707,6 +862,55 @@ class TranslatorDaemon(rumps.App):
     def _open_gallery(self, _):
         _spawn_subapp(["--gallery"], "/tmp/translator-gallery.log")
 
+    def _open_settings_url(self, url: str, fallback_message: str):
+        if sys.platform != "darwin":
+            return
+        try:
+            subprocess.Popen(["open", url])
+        except Exception:
+            rumps.notification("Local Translator", "请手动打开系统设置", fallback_message)
+
+    def _open_accessibility_settings(self, _):
+        self._open_settings_url(
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+            "隐私与安全性 → 辅助功能 → 启用 Local Translator",
+        )
+
+    def _open_input_monitoring_settings(self, _):
+        self._open_settings_url(
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent",
+            "隐私与安全性 → 输入监控 → 启用 Local Translator",
+        )
+
+    def _open_screen_recording_settings(self, _):
+        self._open_settings_url(
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
+            "隐私与安全性 → 屏幕录制 → 启用 Local Translator",
+        )
+
+    def _open_language_setup(self, _):
+        """Open Apple language downloader and start argos fallback install."""
+        opened_prepare = False
+        prepare_app = self._prepare_app_path()
+        if prepare_app and sys.platform == "darwin":
+            try:
+                subprocess.Popen(["open", prepare_app])
+                opened_prepare = True
+            except Exception:
+                opened_prepare = False
+
+        try:
+            _spawn_subapp(["--install-argos"], "/tmp/translator-language-setup.log")
+            argos_msg = "argos 兜底模型会在后台下载，日志见 /tmp/translator-language-setup.log"
+        except Exception as e:
+            argos_msg = f"argos 后台下载启动失败：{e}"
+
+        if opened_prepare:
+            msg = "已打开 Apple 语言包下载器；" + argos_msg
+        else:
+            msg = "未找到 Apple 语言包下载器；" + argos_msg
+        rumps.notification("Local Translator", "语言包设置", msg)
+
     def _show_usage(self, _):
         rumps.notification(
             "Local Translator",
@@ -776,8 +980,12 @@ def _run_pipeline_after_capture(cap, _log, capture_region, ocr_mod, tr_mod, layo
     blocks = ocr_mod.ocr(cap.png_bytes, min_confidence=0.3)
     _log(f"ocr done: {len(blocks)} blocks")
 
-    src_lang = tr_mod.detect_lang(blocks[0].text) if blocks else "en"
-    _log(f"src_lang={src_lang}, backend={tr_mod.backend_for(src_lang, 'zh')}")
+    target_pref = _target_pref()
+    src_lang, tgt_lang = _pick_langs_for_text(blocks[0].text if blocks else "", target_pref)
+    _log(
+        f"src_lang={src_lang}, target_pref={target_pref}, "
+        f"tgt_lang={tgt_lang}, backend={tr_mod.backend_for(src_lang, tgt_lang)}"
+    )
 
     _stats = {"calls": 0, "empty_in": 0, "empty_out": 0, "errors": 0}
 
@@ -787,7 +995,7 @@ def _run_pipeline_after_capture(cap, _log, capture_region, ocr_mod, tr_mod, layo
             _stats["empty_in"] += 1
             return ""
         try:
-            out = tr_mod.translate(text, src_lang, "zh")
+            out = tr_mod.translate(text, src_lang, tgt_lang)
         except BaseException as e:
             _stats["errors"] += 1
             import traceback as _t
@@ -814,7 +1022,7 @@ def _run_pipeline_after_capture(cap, _log, capture_region, ocr_mod, tr_mod, layo
 
     # --- Step 4: write result.json — editor polls this and hydrates the right column ---
     result = {
-        "src_lang": src_lang, "tgt_lang": "zh",
+        "src_lang": src_lang, "tgt_lang": tgt_lang,
         "blocks": [asdict(b) for b in blocks],
         "translations": list(translations),
         "aligned": [asdict(a) for a in aligned],
@@ -966,12 +1174,104 @@ def _run_hot_worker():
         os._exit(0)
 
 
+def _notify(title: str, subtitle: str, message: str) -> None:
+    if sys.platform != "darwin":
+        return
+    try:
+        q_title = json.dumps(title, ensure_ascii=False)
+        q_subtitle = json.dumps(subtitle, ensure_ascii=False)
+        q_message = json.dumps(message, ensure_ascii=False)
+        subprocess.run(
+            [
+                "osascript", "-e",
+                f"display notification {q_message} with title {q_title} subtitle {q_subtitle}",
+            ],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3,
+        )
+    except Exception:
+        pass
+
+
+def _run_argos_installer():
+    """Install argos fallback models from inside the app bundle.
+
+    DMG installs do not run install.sh, so a fresh Mac has no models under
+    ~/.local/share/argos-translate. This subprocess keeps the menubar daemon
+    responsive while users recover the fallback engine from the menu.
+    """
+    if RESOURCES not in sys.path:
+        sys.path.insert(0, RESOURCES)
+
+    log_path = "/tmp/translator-language-setup.log"
+
+    def _log(msg):
+        try:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+                f.flush()
+        except Exception:
+            pass
+
+    _log("argos installer started")
+    _notify("Local Translator", "argos 模型下载", "开始下载 argos 兜底模型")
+    try:
+        import argostranslate.package as pkg
+    except Exception as e:
+        _log(f"import argostranslate failed: {e}")
+        _notify("Local Translator", "argos 模型下载失败", "应用内缺少 argostranslate 组件")
+        return
+
+    try:
+        pkg.update_package_index()
+        available = pkg.get_available_packages()
+    except Exception as e:
+        _log(f"update package index failed: {e}")
+        _notify("Local Translator", "argos 模型下载失败", "无法更新模型索引，请检查网络或代理")
+        return
+
+    try:
+        installed_pairs = {(p.from_code, p.to_code) for p in pkg.get_installed_packages()}
+    except Exception:
+        installed_pairs = set()
+
+    installed_now = 0
+    skipped = 0
+    failed = 0
+    for src, tgt in ARGOS_REQUIRED_PAIRS:
+        if (src, tgt) in installed_pairs:
+            skipped += 1
+            continue
+        matched = next((p for p in available if p.from_code == src and p.to_code == tgt), None)
+        if matched is None:
+            _log(f"missing package in index: {src}->{tgt}")
+            failed += 1
+            continue
+        try:
+            _log(f"downloading {src}->{tgt}")
+            pkg.install_from_path(matched.download())
+            installed_now += 1
+            installed_pairs.add((src, tgt))
+            _log(f"installed {src}->{tgt}")
+        except Exception as e:
+            failed += 1
+            _log(f"download/install failed {src}->{tgt}: {e}")
+
+    total = len(installed_pairs)
+    _log(f"argos installer finished: installed_now={installed_now} skipped={skipped} failed={failed} total={total}")
+    if installed_now or total:
+        _notify("Local Translator", "argos 模型下载完成", f"argos 可用模型：{total} 组")
+    else:
+        _notify("Local Translator", "argos 模型下载失败", "未安装任何 argos 模型，请查看日志")
+
+
 if __name__ == "__main__":
     args = sys.argv[1:]
     if args and args[0] == "--worker":
         _run_worker()
     elif args and args[0] == "--hot-worker":
         _run_hot_worker()
+    elif args and args[0] == "--install-argos":
+        _run_argos_installer()
     elif args and args[0] == "--gallery":
         _run_subapp("ui/gallery_window.py", [])
     elif args and args[0] == "--capture":

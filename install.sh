@@ -10,36 +10,64 @@ echo "  Local Translator Installer"
 echo "========================================="
 echo ""
 
-# 检查 Python3
-if ! command -v python3 &>/dev/null; then
-    echo "[ERROR] Python3 not found. Please install Python3 first."
+# 选择一个 Python，并在整个安装流程里保持一致。
+# macOS 上用户的 PATH 经常是 `python3` 指向 Homebrew 新版本，
+# 但 `pip3` 指向 Xcode/系统 Python；混用会把依赖和模型装到不同环境。
+pick_python() {
+    local candidates=()
+    if [[ -n "${PYTHON_BIN:-}" ]]; then
+        candidates+=("$PYTHON_BIN")
+    fi
+    if [[ "$(uname)" == "Darwin" && -x /usr/bin/python3 ]]; then
+        candidates+=("/usr/bin/python3")
+    fi
+    if command -v python3 &>/dev/null; then
+        candidates+=("$(command -v python3)")
+    fi
+    candidates+=("/opt/homebrew/bin/python3" "/usr/local/bin/python3")
+
+    local py
+    for py in "${candidates[@]}"; do
+        [[ -x "$py" ]] || continue
+        "$py" - <<'PYEOF' >/dev/null 2>&1 && { echo "$py"; return 0; }
+import sys
+# argostranslate/ctranslate2 wheels lag behind brand-new Python releases.
+raise SystemExit(not ((3, 9) <= sys.version_info[:2] < (3, 13)))
+PYEOF
+    done
+    return 1
+}
+
+PYTHON_BIN="$(pick_python || true)"
+if [[ -z "$PYTHON_BIN" ]]; then
+    echo "[ERROR] No compatible Python found. Need Python 3.9-3.12."
     echo "  macOS:   xcode-select --install"
     echo "  Linux:   sudo apt install python3 python3-pip"
     echo "  Windows: https://www.python.org/downloads/"
     exit 1
 fi
 
-PY_VERSION=$(python3 --version)
-echo "[OK] Found $PY_VERSION"
+PY_VERSION=$("$PYTHON_BIN" --version)
+echo "[OK] Found $PY_VERSION at $PYTHON_BIN"
 
-# 检查 pip3
-if ! command -v pip3 &>/dev/null; then
-    echo "[INFO] pip3 not found, installing..."
-    python3 -m ensurepip --upgrade 2>/dev/null || {
-        echo "[ERROR] Failed to install pip. Please install manually."
+# 检查 pip for the selected Python
+if ! "$PYTHON_BIN" -m pip --version &>/dev/null; then
+    echo "[INFO] pip not found for $PYTHON_BIN, installing..."
+    "$PYTHON_BIN" -m ensurepip --upgrade --user 2>/dev/null || "$PYTHON_BIN" -m ensurepip --upgrade 2>/dev/null || {
+        echo "[ERROR] Failed to install pip for $PYTHON_BIN. Please install manually."
         exit 1
     }
 fi
-echo "[OK] Found pip3"
+echo "[OK] Found pip for $PYTHON_BIN"
 
 # 升级 pip
 echo "[INFO] Upgrading pip..."
-python3 -m pip install --upgrade pip 2>/dev/null || pip3 install --upgrade pip 2>/dev/null || true
+"$PYTHON_BIN" -m pip install --user --upgrade pip 2>/dev/null || "$PYTHON_BIN" -m pip install --upgrade pip 2>/dev/null || true
 
 # 安装依赖
 echo ""
 echo "[INFO] Installing pywebview and argostranslate..."
-pip3 install pywebview argostranslate rumps pynput \
+"$PYTHON_BIN" -m pip install --user pywebview argostranslate rumps pynput \
     pyobjc-framework-ApplicationServices \
     pyobjc-framework-Vision \
     pyobjc-framework-Quartz \
@@ -49,7 +77,7 @@ echo "[OK] Dependencies installed"
 # 下载 argos 语言包（兜底翻译引擎）
 echo ""
 echo "[INFO] Downloading argos language packs (this may take a few minutes)..."
-ARGOS_COUNT=$(python3 - <<'PYEOF'
+ARGOS_COUNT=$("$PYTHON_BIN" - <<'PYEOF'
 import argostranslate.package as pkg
 import sys
 
@@ -126,6 +154,23 @@ if [[ "$(uname)" == "Darwin" ]]; then
                 if swiftc -O -parse-as-library -o probe-prepare probe_prepare.swift 2>&1; then
                     mkdir -p TranslatorPrepare.app/Contents/MacOS
                     cp probe-prepare TranslatorPrepare.app/Contents/MacOS/TranslatorPrepare
+                    cat > TranslatorPrepare.app/Contents/Info.plist <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleExecutable</key><string>TranslatorPrepare</string>
+	<key>CFBundleIdentifier</key><string>com.local.translator.prepare</string>
+	<key>CFBundleName</key><string>TranslatorPrepare</string>
+	<key>CFBundleDisplayName</key><string>TranslatorPrepare</string>
+	<key>CFBundlePackageType</key><string>APPL</string>
+	<key>CFBundleShortVersionString</key><string>1.0</string>
+	<key>CFBundleVersion</key><string>1</string>
+	<key>LSMinimumSystemVersion</key><string>15.0</string>
+	<key>NSHighResolutionCapable</key><true/>
+</dict>
+</plist>
+PLIST
                     echo "[OK] Built swift/TranslatorPrepare.app (Apple 语言包下载器)"
                 else
                     echo "[WARN] TranslatorPrepare.app 编译失败，Apple 语言包需要手动通过系统设置下载"
@@ -146,18 +191,21 @@ if [[ "$(uname)" == "Darwin" ]]; then
     echo ""
     echo "[INFO] Creating macOS apps..."
     SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-    SITE_PACKAGES=$(python3 -c "import site; print(site.getusersitepackages())")
+    SITE_PACKAGES=$("$PYTHON_BIN" -c "import site; print(site.getusersitepackages())")
+    PYTHON_BIN_Q=$(printf "%q" "$PYTHON_BIN")
+    SCRIPT_DIR_Q=$(printf "%q" "$SCRIPT_DIR")
+    SITE_PACKAGES_Q=$(printf "%q" "$SITE_PACKAGES")
 
     # 原有翻译器窗口应用
     APP_PATH="$SCRIPT_DIR/Local Translator.app"
     rm -rf "$APP_PATH"
-    osacompile -o "$APP_PATH" -e "do shell script \"export PYTHONPATH=$SITE_PACKAGES && /usr/bin/python3 $SCRIPT_DIR/app.py &> /tmp/translator.log &\""
+    osacompile -o "$APP_PATH" -e "do shell script \"export PYTHONPATH=$SITE_PACKAGES_Q && $PYTHON_BIN_Q $SCRIPT_DIR_Q/app.py &> /tmp/translator.log &\""
     echo "[OK] Created 'Local Translator.app'"
 
     # 选中即翻译后台服务
     DAEMON_PATH="$SCRIPT_DIR/Translate Daemon.app"
     rm -rf "$DAEMON_PATH"
-    osacompile -o "$DAEMON_PATH" -e "do shell script \"export PYTHONPATH=$SITE_PACKAGES && /usr/bin/python3 $SCRIPT_DIR/daemon.py &> /tmp/translator-daemon.log &\""
+    osacompile -o "$DAEMON_PATH" -e "do shell script \"export PYTHONPATH=$SITE_PACKAGES_Q && $PYTHON_BIN_Q $SCRIPT_DIR_Q/daemon.py &> /tmp/translator-daemon.log &\""
     echo "[OK] Created 'Translate Daemon.app'"
 fi
 
@@ -193,8 +241,10 @@ cat > "$WORKFLOW_PATH/Contents/Info.plist" << 'INFOEOF'
 </plist>
 INFOEOF
 
-SITE_PKG=$(python3 -c "import site; print(site.getusersitepackages())")
-TRANSLATE_CMD="export PYTHONPATH=$SITE_PKG\n/usr/bin/python3 $SCRIPT_DIR/translate_cli.py --dialog"
+SITE_PKG=$("$PYTHON_BIN" -c "import site; print(site.getusersitepackages())")
+PYTHON_BIN_Q=$(printf "%q" "$PYTHON_BIN")
+SCRIPT_DIR_Q=$(printf "%q" "$SCRIPT_DIR")
+SITE_PKG_Q=$(printf "%q" "$SITE_PKG")
 
 cat > "$WORKFLOW_PATH/Contents/document.wflow" << WFEOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -219,8 +269,8 @@ cat > "$WORKFLOW_PATH/Contents/document.wflow" << WFEOF
 				<key>ActionName</key><string>Run Shell Script</string>
 				<key>ActionParameters</key>
 				<dict>
-					<key>COMMAND_STRING</key><string>export PYTHONPATH=$SITE_PKG
-/usr/bin/python3 $SCRIPT_DIR/translate_cli.py --dialog</string>
+					<key>COMMAND_STRING</key><string>export PYTHONPATH=$SITE_PKG_Q
+$PYTHON_BIN_Q $SCRIPT_DIR_Q/translate_cli.py --dialog</string>
 					<key>CheckedForUserDefaultShell</key><true/>
 					<key>inputMethod</key><integer>0</integer>
 					<key>shell</key><string>/bin/bash</string>
@@ -285,8 +335,10 @@ echo "    1. Select any text"
 echo "    2. Right-click -> Services -> Translate"
 echo "    3. Dialog shows translation with Copy button"
 echo ""
-echo "  IMPORTANT: First launch requires Accessibility permission."
-echo "    System Settings -> Privacy & Security -> Accessibility"
+echo "  IMPORTANT: First launch requires permissions from the menu bar:"
+echo "    1. Translator menu -> ② 授权辅助功能（全局热键）"
+echo "    2. Translator menu -> ③ 授权输入监控（选中文字）"
+echo "    3. Translator menu -> ④ 授权屏幕录制（截图翻译）"
 echo ""
 
 # 让用户输入快捷键确认学会
@@ -335,10 +387,10 @@ echo "  Installation complete!"
 echo "========================================="
 echo ""
 echo "  Usage:"
-echo "    Translator window:   python3 $SCRIPT_DIR_FINAL/app.py"
-echo "    Select-to-translate:  python3 $SCRIPT_DIR_FINAL/daemon.py"
+echo "    Translator window:   $PYTHON_BIN $SCRIPT_DIR_FINAL/app.py"
+echo "    Select-to-translate:  $PYTHON_BIN $SCRIPT_DIR_FINAL/daemon.py"
 if [[ "$(uname)" == "Darwin" ]]; then
 echo "    macOS apps:  Double click 'Local Translator.app' or 'Translate Daemon.app'"
 fi
-echo "    Browser mode:  python3 $SCRIPT_DIR_FINAL/serve.py"
+echo "    Browser mode:  $PYTHON_BIN $SCRIPT_DIR_FINAL/serve.py"
 echo ""
