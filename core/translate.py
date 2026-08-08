@@ -244,3 +244,24 @@ def detect_lang(text: str) -> str:
     if _ARABIC.search(text):
         return "ar"
     return "en"
+
+
+def detect_lang_for_target(text: str, target: str) -> str:
+    """Detect the part of mixed text that still needs translation.
+
+    When an explicit target script is already present, ignore it while looking
+    for a source.  This prevents ``Hello 你好`` with target ``zh`` from being
+    classified as Chinese and returned unchanged.
+    """
+    checks = (
+        ("ja", _HIRA, _KATA),
+        ("ko", _HANGUL),
+        ("zh", _CJK),
+        ("ru", _CYRILLIC),
+        ("ar", _ARABIC),
+        ("en", re.compile(r"[A-Za-z]")),
+    )
+    for code, *patterns in checks:
+        if code != target and any(pattern.search(text) for pattern in patterns):
+            return code
+    return target if target else detect_lang(text)

@@ -50,8 +50,8 @@ OPTIONS = {
         "CFBundleName": "Local Translator",
         "CFBundleDisplayName": "Local Translator",
         "CFBundleIdentifier": "com.local.translator",
-        "CFBundleVersion": "2.2.0",
-        "CFBundleShortVersionString": "2.2.0",
+        "CFBundleVersion": "2.2.1",
+        "CFBundleShortVersionString": "2.2.1",
         "LSMinimumSystemVersion": "15.0",
         # Menubar-only: hide Dock icon.
         "LSUIElement": True,

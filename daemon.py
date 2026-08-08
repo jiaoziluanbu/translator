@@ -60,7 +60,7 @@ atexit.register(_atexit_dump)
 # them out for subprocess mode shaves that off.
 _SUBPROCESS_FLAGS = {"--worker", "--hot-worker", "--gallery", "--capture",
                      "--from-meta", "--from-result", "--from-image",
-                     "--install-argos"}
+                     "--install-argos", "--service-translate"}
 _IS_SUBPROCESS = (len(sys.argv) > 1 and sys.argv[1] in _SUBPROCESS_FLAGS)
 
 if _IS_SUBPROCESS:
@@ -220,16 +220,110 @@ def _detect_src_text(text: str) -> str:
     return "en"
 
 
+def _detect_src_for_target(text: str, target: str) -> str:
+    """Pick a source language while never changing an explicit target.
+
+    Mixed-language text commonly contains both the requested target language
+    and another language (for example ``Hello 你好`` with target ``zh``).  In
+    that case the non-target script is the part that still needs translation,
+    so prefer it as the source.  If the text only contains the target language,
+    return the target itself and let the translator perform a no-op.
+    """
+    checks = (
+        ("ja", lambda c: "぀" <= c <= "ゟ" or "゠" <= c <= "ヿ"),
+        ("ko", lambda c: "가" <= c <= "힯"),
+        ("zh", lambda c: "一" <= c <= "鿿"),
+        ("en", lambda c: ("A" <= c <= "Z") or ("a" <= c <= "z")),
+    )
+    for code, contains in checks:
+        if code != target and any(contains(c) for c in text):
+            return code
+    if target in _TARGET_LANG_CODES and target != "auto":
+        return target
+    return _detect_src_text(text)
+
+
 def _pick_langs_for_text(text: str, target_pref=None):
     """Pick (src, tgt) using the same rules for selected text and screenshots."""
-    src = _detect_src_text(text)
     target = target_pref if target_pref in _TARGET_LANG_CODES else _target_pref()
     if target == "auto":
+        src = _detect_src_text(text)
         return (src, "en") if src == "zh" else (src, "zh")
-    if target == src:
-        # Avoid same→same: pick the most useful alternative.
-        return (src, "en") if src != "en" else (src, "zh")
-    return src, target
+    return _detect_src_for_target(text, target), target
+
+
+def _helper_bin_path():
+    """Resolve the bundled/dev Swift helper without constructing the UI app."""
+    for cand in (
+        os.path.join(RESOURCES, "swift", "translator-helper"),
+        os.path.expanduser(
+            "~/Library/Application Support/LocalTranslator/bin/translator-helper"
+        ),
+    ):
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return None
+
+
+def _translate_with_swift_once(text: str, src: str, tgt: str) -> str:
+    """Translate through the small Swift helper; return empty on soft failure."""
+    helper = _helper_bin_path()
+    if not helper:
+        return ""
+    try:
+        req = json.dumps(
+            {"text": text, "src": src, "tgt": tgt}, ensure_ascii=False
+        ) + "\n"
+        proc = subprocess.run(
+            [helper], input=req,
+            capture_output=True, text=True, timeout=8,
+            encoding="utf-8", errors="replace",
+        )
+        lines = (proc.stdout or "").strip().splitlines()
+        if lines:
+            payload = json.loads(lines[0])
+            if payload.get("ok") and payload.get("text"):
+                return payload["text"]
+    except Exception:
+        pass
+    return ""
+
+
+def _translate_service_text(text: str, target_pref=None) -> str:
+    """Translate text for the macOS right-click Service inside the app bundle.
+
+    This entry point first uses the tiny Swift helper and only imports the
+    bundled argos stack when Apple Translation cannot handle the request.  It
+    therefore works without a separately installed, argos-compatible Python.
+    """
+    text = (text or "").strip()
+    if not text:
+        return ""
+    src, tgt = _pick_langs_for_text(text, target_pref)
+    if src == tgt:
+        return text
+    result = _translate_with_swift_once(text, src, tgt)
+    if result:
+        return result
+    try:
+        if RESOURCES not in sys.path:
+            sys.path.insert(0, RESOURCES)
+        from core import translate as tr_mod
+        return tr_mod.translate(text, src, tgt)
+    except BaseException as exc:
+        return (
+            "[翻译失败：应用内翻译组件不可用。"
+            "请从菜单栏运行“① 下载/检查语言包”后重试。"
+            f"详情：{type(exc).__name__}: {exc}]"
+        )
+
+
+def _run_service_translate():
+    """CLI bridge used by the installed macOS Service."""
+    result = _translate_service_text(sys.stdin.read(), _target_pref())
+    if result:
+        sys.stdout.write(result)
+        sys.stdout.flush()
 
 
 class TranslatorDaemon(rumps.App):
@@ -635,15 +729,7 @@ class TranslatorDaemon(rumps.App):
     def _helper_bin(self):
         """Resolve swift translator-helper path. Bundle first, then user
         install dir (where the right-click Service used to live)."""
-        for cand in (
-            os.path.join(RESOURCES, "swift", "translator-helper"),
-            os.path.expanduser(
-                "~/Library/Application Support/LocalTranslator/bin/translator-helper"
-            ),
-        ):
-            if os.path.isfile(cand) and os.access(cand, os.X_OK):
-                return cand
-        return None
+        return _helper_bin_path()
 
     def _prepare_app_path(self):
         """Bundled Apple Translation language-pack downloader, if present."""
@@ -942,7 +1028,7 @@ def _worker_log_factory(label: str):
     return _log
 
 
-def _run_pipeline_after_capture(cap, _log, capture_region, ocr_mod, tr_mod, layout_mod):
+def _run_pipeline_after_capture(cap, _log, ocr_mod=None, tr_mod=None, layout_mod=None):
     """Body of the capture pipeline starting from a successful `cap`.
 
     Optimized layout (2026-04-29): spawn the editor *immediately* with just
@@ -976,6 +1062,17 @@ def _run_pipeline_after_capture(cap, _log, capture_region, ocr_mod, tr_mod, layo
     _spawn_subapp(["--from-image", image_meta_path], "/tmp/translator-capture.log")
     _log(f"editor spawned (image-only); will hydrate from {result_path}")
 
+    # Cold workers deliberately defer this heavy import until after both the
+    # selection overlay and image-only editor are visible.  Importing
+    # core.translate pulls argos/torch and costs several seconds on a cold
+    # process; it must not sit between the shortcut and the capture overlay.
+    if ocr_mod is None or tr_mod is None or layout_mod is None:
+        _log("loading OCR/translation stack after capture")
+        from core import ocr as ocr_mod
+        from core import translate as tr_mod
+        from core import layout as layout_mod
+        _log("OCR/translation stack ready")
+
     # --- Step 2: OCR ---
     blocks = ocr_mod.ocr(cap.png_bytes, min_confidence=0.3)
     _log(f"ocr done: {len(blocks)} blocks")
@@ -987,19 +1084,27 @@ def _run_pipeline_after_capture(cap, _log, capture_region, ocr_mod, tr_mod, layo
         f"tgt_lang={tgt_lang}, backend={tr_mod.backend_for(src_lang, tgt_lang)}"
     )
 
-    _stats = {"calls": 0, "empty_in": 0, "empty_out": 0, "errors": 0}
+    _stats = {"calls": 0, "empty_in": 0, "empty_out": 0, "errors": 0, "sources": {}}
 
     def _translate(text):
         _stats["calls"] += 1
         if not text.strip():
             _stats["empty_in"] += 1
             return ""
+        # Detect each visual paragraph independently.  A screenshot can contain
+        # Chinese UI chrome, an English article and Japanese labels at once;
+        # the chosen target remains fixed while only the local source changes.
+        local_src = _detect_src_for_target(text, tgt_lang)
+        _stats["sources"][local_src] = _stats["sources"].get(local_src, 0) + 1
         try:
-            out = tr_mod.translate(text, src_lang, tgt_lang)
+            out = tr_mod.translate(text, local_src, tgt_lang)
         except BaseException as e:
             _stats["errors"] += 1
             import traceback as _t
-            _log(f"  translate ERR: {type(e).__name__}: {e}; src={text[:80]!r}")
+            _log(
+                f"  translate ERR: {type(e).__name__}: {e}; "
+                f"pair={local_src}->{tgt_lang}; src={text[:80]!r}"
+            )
             _log("  traceback: " + _t.format_exc())
             return ""
         if not out or not out.strip():
@@ -1066,16 +1171,15 @@ def _run_pipeline_after_capture(cap, _log, capture_region, ocr_mod, tr_mod, layo
 def _run_worker():
     """Cold one-shot capture pipeline. Used as fallback when no hot worker
     is ready, or when the user invoked --worker directly. ~3-5s cold start
-    because the heavy stack imports here. The daemon prefers --hot-worker."""
+    because the processing stack still imports here after selection.  The
+    capture overlay itself stays fast because it is imported and shown first."""
     if RESOURCES not in sys.path:
         sys.path.insert(0, RESOURCES)
     _log = _worker_log_factory("cold")
     _log("started")
     try:
         from ui.capture import capture_region
-        from core import ocr as _ocr_mod
-        from core import translate as _tr
-        from core import layout as _layout
+        _log("capture UI ready")
     except BaseException as e:
         import traceback
         _log(f"import failed: {type(e).__name__}: {e}\n{traceback.format_exc()}")
@@ -1091,7 +1195,7 @@ def _run_worker():
             copy_png_to_pasteboard(cap.png_bytes)
             _log(f"copied to pasteboard: {len(cap.png_bytes)} bytes")
             os._exit(0)
-        _run_pipeline_after_capture(cap, _log, capture_region, _ocr_mod, _tr, _layout)
+        _run_pipeline_after_capture(cap, _log)
     except BaseException as e:
         import traceback
         _log(f"worker failed: {type(e).__name__}: {e}\n{traceback.format_exc()}")
@@ -1166,7 +1270,7 @@ def _run_hot_worker():
             copy_png_to_pasteboard(cap.png_bytes)
             _log(f"copied to pasteboard: {len(cap.png_bytes)} bytes")
             os._exit(0)
-        _run_pipeline_after_capture(cap, _log, capture_region, _ocr_mod, _tr, _layout)
+        _run_pipeline_after_capture(cap, _log, _ocr_mod, _tr, _layout)
     except BaseException as e:
         import traceback
         _log(f"hot worker pipeline failed: {type(e).__name__}: {e}\n{traceback.format_exc()}")
@@ -1272,6 +1376,8 @@ if __name__ == "__main__":
         _run_hot_worker()
     elif args and args[0] == "--install-argos":
         _run_argos_installer()
+    elif args and args[0] == "--service-translate":
+        _run_service_translate()
     elif args and args[0] == "--gallery":
         _run_subapp("ui/gallery_window.py", [])
     elif args and args[0] == "--capture":

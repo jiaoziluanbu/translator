@@ -96,7 +96,7 @@ fi
 
 # 6. Build a simple .dmg via hdiutil (no signing, no fancy layout).
 echo "==> building dmg"
-DMG_NAME="LocalTranslator-2.2.0.dmg"
+DMG_NAME="LocalTranslator-2.2.1.dmg"
 DMG_TMP="dist/.dmg-staging"
 rm -rf "$DMG_TMP" "dist/$DMG_NAME"
 mkdir -p "$DMG_TMP"
