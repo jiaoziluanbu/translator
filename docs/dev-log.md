@@ -32,6 +32,15 @@
 - The built app's Service bridge translated `Hello world` to `你好，世界`.
 - Installed Service script hash matches the release source script.
 
+### GitHub publication
+
+- Functional release commit: `a862f0d28f93bb7337a0c913607ea023bb9ee21c` (`release: fix capture latency and translation routing`).
+- Pushed branch: `codex/optimize-translator-memory`.
+- Updated existing Draft PR #1: `https://github.com/jiaoziluanbu/translator/pull/1`.
+- Published non-draft, non-prerelease GitHub Release `v2.2.1`, marked as Latest: `https://github.com/jiaoziluanbu/translator/releases/tag/v2.2.1`.
+- Remote tag `v2.2.1` points to the verified functional release commit `a862f0d28f93bb7337a0c913607ea023bb9ee21c`.
+- GitHub reports the DMG asset as `uploaded`, 564,091,013 bytes, with server digest `sha256:b027100b73b2448412e5c7567fd26d1396f0f494296b4f25b6aa00244c68e79a`, matching the local artifact.
+
 ### Data impact
 
 - Gallery files remained at 10 files / 1.1 MB; preferences hash remained unchanged.
@@ -49,7 +58,7 @@
 
 - The app uses ad-hoc signing and is not Apple-notarized, so first launch on another Mac may still require right-clicking the app and choosing Open.
 - py2app reports many missing optional imports from transitive packages; these are existing platform/dev extras, and the bundled translation path passed runtime verification.
-- GitHub commit, branch push, PR update, tag, Release, and asset upload are still pending at this checkpoint.
+- Draft PR #1 remains unmerged by design; `main` was not changed during this release.
 
 ## 2026-08-08 - Build and install the screenshot/translation fixes
 
