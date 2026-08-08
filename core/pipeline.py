@@ -55,14 +55,16 @@ def run_ocr_translate(
     if not blocks:
         return [], [], [], src_lang or "en"
 
+    fixed_src = src_lang is not None
     if src_lang is None:
-        src_lang = tr_mod.detect_lang(blocks[0].text)
+        src_lang = tr_mod.detect_lang_for_target(blocks[0].text, tgt_lang)
 
     def _translate(text: str) -> str:
         if not text.strip():
             return ""
+        local_src = src_lang if fixed_src else tr_mod.detect_lang_for_target(text, tgt_lang)
         try:
-            return tr_mod.translate(text, src_lang, tgt_lang)
+            return tr_mod.translate(text, local_src, tgt_lang)
         except tr_mod.TranslateError:
             return ""
 

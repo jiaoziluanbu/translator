@@ -20,6 +20,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 import warnings
 from functools import lru_cache
 
@@ -61,6 +62,8 @@ class _AppleHelper:
         self._proc: subprocess.Popen | None = None
         self._lock = threading.Lock()
         self._installed_pairs: set[tuple[str, str]] | None = None
+        self._installed_checked_at = 0.0
+        self._installed_ttl_s = float(os.environ.get("LT_APPLE_PAIR_CACHE_TTL", "10"))
 
     def available(self) -> bool:
         return os.path.isfile(self.path) and os.access(self.path, os.X_OK)
@@ -89,10 +92,15 @@ class _AppleHelper:
 
     def installed_pairs(self) -> set[tuple[str, str]]:
         """Return the set of (src, tgt) short codes the helper reports as installed."""
-        if self._installed_pairs is not None:
+        now = time.monotonic()
+        if (
+            self._installed_pairs is not None
+            and now - self._installed_checked_at < self._installed_ttl_s
+        ):
             return self._installed_pairs
         if not self.available():
             self._installed_pairs = set()
+            self._installed_checked_at = now
             return self._installed_pairs
         try:
             out = subprocess.run(
@@ -109,7 +117,12 @@ class _AppleHelper:
             }
         except Exception:
             self._installed_pairs = set()
+        self._installed_checked_at = now
         return self._installed_pairs
+
+    def invalidate_installed_cache(self) -> None:
+        self._installed_pairs = None
+        self._installed_checked_at = 0.0
 
     def supports(self, src: str, tgt: str) -> bool:
         return (src, tgt) in self.installed_pairs()
@@ -139,6 +152,7 @@ class _AppleHelper:
             err = resp.get("error", "unknown")
             # `notInstalled` is the soft case — caller will retry via argos.
             if "notInstalled" in err:
+                self.invalidate_installed_cache()
                 raise TranslateError("notInstalled")
             raise TranslateError(err)
         return resp["text"]
@@ -230,3 +244,24 @@ def detect_lang(text: str) -> str:
     if _ARABIC.search(text):
         return "ar"
     return "en"
+
+
+def detect_lang_for_target(text: str, target: str) -> str:
+    """Detect the part of mixed text that still needs translation.
+
+    When an explicit target script is already present, ignore it while looking
+    for a source.  This prevents ``Hello 你好`` with target ``zh`` from being
+    classified as Chinese and returned unchanged.
+    """
+    checks = (
+        ("ja", _HIRA, _KATA),
+        ("ko", _HANGUL),
+        ("zh", _CJK),
+        ("ru", _CYRILLIC),
+        ("ar", _ARABIC),
+        ("en", re.compile(r"[A-Za-z]")),
+    )
+    for code, *patterns in checks:
+        if code != target and any(pattern.search(text) for pattern in patterns):
+            return code
+    return target if target else detect_lang(text)

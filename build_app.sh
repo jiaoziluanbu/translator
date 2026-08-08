@@ -7,6 +7,37 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
+pick_python() {
+    local candidates=()
+    if [[ -n "${PYTHON_BIN:-}" ]]; then
+        candidates+=("$PYTHON_BIN")
+    fi
+    if [[ "$(uname)" == "Darwin" && -x /usr/bin/python3 ]]; then
+        candidates+=("/usr/bin/python3")
+    fi
+    if command -v python3 &>/dev/null; then
+        candidates+=("$(command -v python3)")
+    fi
+    candidates+=("/opt/homebrew/bin/python3" "/usr/local/bin/python3")
+
+    local py
+    for py in "${candidates[@]}"; do
+        [[ -x "$py" ]] || continue
+        "$py" - <<'PYEOF' >/dev/null 2>&1 && { echo "$py"; return 0; }
+import sys
+raise SystemExit(not ((3, 9) <= sys.version_info[:2] < (3, 13)))
+PYEOF
+    done
+    return 1
+}
+
+PYTHON_BIN="$(pick_python || true)"
+if [[ -z "$PYTHON_BIN" ]]; then
+    echo "ERROR: No compatible Python found. Need Python 3.9-3.12." >&2
+    exit 1
+fi
+echo "==> using $("$PYTHON_BIN" --version) at $PYTHON_BIN"
+
 # 1. Compile Swift translator helper.
 echo "==> compiling swift/translator-helper"
 ( cd swift && swiftc -O -parse-as-library -o translator-helper translator_helper.swift )
@@ -15,7 +46,25 @@ echo "==> compiling swift/translator-helper"
 echo "==> compiling swift/TranslatorPrepare.app"
 ( cd swift && swiftc -O -parse-as-library -o probe-prepare probe_prepare.swift && \
     mkdir -p TranslatorPrepare.app/Contents/MacOS && \
-    cp probe-prepare TranslatorPrepare.app/Contents/MacOS/TranslatorPrepare )
+    cp probe-prepare TranslatorPrepare.app/Contents/MacOS/TranslatorPrepare && \
+    cat > TranslatorPrepare.app/Contents/Info.plist <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleExecutable</key><string>TranslatorPrepare</string>
+	<key>CFBundleIdentifier</key><string>com.local.translator.prepare</string>
+	<key>CFBundleName</key><string>TranslatorPrepare</string>
+	<key>CFBundleDisplayName</key><string>TranslatorPrepare</string>
+	<key>CFBundlePackageType</key><string>APPL</string>
+	<key>CFBundleShortVersionString</key><string>1.0</string>
+	<key>CFBundleVersion</key><string>1</string>
+	<key>LSMinimumSystemVersion</key><string>15.0</string>
+	<key>NSHighResolutionCapable</key><true/>
+</dict>
+</plist>
+PLIST
+)
 
 # 3. Clean previous py2app artifacts (move aside so the user can recover them).
 TS=$(date +%Y%m%d-%H%M%S)
@@ -25,7 +74,7 @@ TS=$(date +%Y%m%d-%H%M%S)
 # 4. Run py2app. Bumped recursion limit because modulegraph blows up on
 #    deeply nested ASTs in some transitive deps.
 echo "==> running py2app (this takes 2-5 minutes)"
-python3 -c "
+"$PYTHON_BIN" -c "
 import sys
 sys.setrecursionlimit(10000)
 sys.argv = ['setup.py', 'py2app']
@@ -35,6 +84,9 @@ exec(open('setup.py').read())
 # 5. Copy the language-downloader .app next to the main bundle inside Resources/
 #    so a user-visible 'install language packs' helper ships with the .dmg.
 cp -R swift/TranslatorPrepare.app "dist/Local Translator.app/Contents/Resources/swift/"
+if command -v codesign >/dev/null 2>&1; then
+    codesign --force --deep --sign - "dist/Local Translator.app"
+fi
 
 echo "==> build done: dist/Local Translator.app ($(du -sh "dist/Local Translator.app" | cut -f1))"
 
@@ -44,11 +96,13 @@ fi
 
 # 6. Build a simple .dmg via hdiutil (no signing, no fancy layout).
 echo "==> building dmg"
-DMG_NAME="LocalTranslator-2.1.1.dmg"
+DMG_NAME="LocalTranslator-2.2.1.dmg"
 DMG_TMP="dist/.dmg-staging"
 rm -rf "$DMG_TMP" "dist/$DMG_NAME"
 mkdir -p "$DMG_TMP"
-cp -R "dist/Local Translator.app" "$DMG_TMP/"
+if ! cp -cR "dist/Local Translator.app" "$DMG_TMP/"; then
+    cp -R "dist/Local Translator.app" "$DMG_TMP/"
+fi
 ln -s /Applications "$DMG_TMP/Applications"
 hdiutil create -volname "Local Translator" \
     -srcfolder "$DMG_TMP" \

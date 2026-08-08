@@ -10,50 +10,84 @@ echo "  Local Translator Installer"
 echo "========================================="
 echo ""
 
-# 检查 Python3
-if ! command -v python3 &>/dev/null; then
-    echo "[ERROR] Python3 not found. Please install Python3 first."
+# 选择一个 Python，并在整个安装流程里保持一致。
+# macOS 上用户的 PATH 经常是 `python3` 指向 Homebrew 新版本，
+# 但 `pip3` 指向 Xcode/系统 Python；混用会把依赖和模型装到不同环境。
+pick_python() {
+    local candidates=()
+    if [[ -n "${PYTHON_BIN:-}" ]]; then
+        candidates+=("$PYTHON_BIN")
+    fi
+    if [[ "$(uname)" == "Darwin" && -x /usr/bin/python3 ]]; then
+        candidates+=("/usr/bin/python3")
+    fi
+    if command -v python3 &>/dev/null; then
+        candidates+=("$(command -v python3)")
+    fi
+    candidates+=("/opt/homebrew/bin/python3" "/usr/local/bin/python3")
+
+    local py
+    for py in "${candidates[@]}"; do
+        [[ -x "$py" ]] || continue
+        "$py" - <<'PYEOF' >/dev/null 2>&1 && { echo "$py"; return 0; }
+import sys
+# argostranslate/ctranslate2 wheels lag behind brand-new Python releases.
+raise SystemExit(not ((3, 9) <= sys.version_info[:2] < (3, 13)))
+PYEOF
+    done
+    return 1
+}
+
+PYTHON_BIN="$(pick_python || true)"
+if [[ -z "$PYTHON_BIN" ]]; then
+    echo "[ERROR] No compatible Python found. Need Python 3.9-3.12."
     echo "  macOS:   xcode-select --install"
     echo "  Linux:   sudo apt install python3 python3-pip"
     echo "  Windows: https://www.python.org/downloads/"
     exit 1
 fi
 
-PY_VERSION=$(python3 --version)
-echo "[OK] Found $PY_VERSION"
+PY_VERSION=$("$PYTHON_BIN" --version)
+echo "[OK] Found $PY_VERSION at $PYTHON_BIN"
 
-# 检查 pip3
-if ! command -v pip3 &>/dev/null; then
-    echo "[INFO] pip3 not found, installing..."
-    python3 -m ensurepip --upgrade 2>/dev/null || {
-        echo "[ERROR] Failed to install pip. Please install manually."
+# 检查 pip for the selected Python
+if ! "$PYTHON_BIN" -m pip --version &>/dev/null; then
+    echo "[INFO] pip not found for $PYTHON_BIN, installing..."
+    "$PYTHON_BIN" -m ensurepip --upgrade --user 2>/dev/null || "$PYTHON_BIN" -m ensurepip --upgrade 2>/dev/null || {
+        echo "[ERROR] Failed to install pip for $PYTHON_BIN. Please install manually."
         exit 1
     }
 fi
-echo "[OK] Found pip3"
+echo "[OK] Found pip for $PYTHON_BIN"
 
 # 升级 pip
 echo "[INFO] Upgrading pip..."
-python3 -m pip install --upgrade pip 2>/dev/null || pip3 install --upgrade pip 2>/dev/null || true
+"$PYTHON_BIN" -m pip install --user --upgrade pip 2>/dev/null || "$PYTHON_BIN" -m pip install --upgrade pip 2>/dev/null || true
 
 # 安装依赖
 echo ""
 echo "[INFO] Installing pywebview and argostranslate..."
-pip3 install pywebview argostranslate rumps pynput \
+"$PYTHON_BIN" -m pip install --user pywebview argostranslate rumps pynput \
     pyobjc-framework-ApplicationServices \
     pyobjc-framework-Vision \
     pyobjc-framework-Quartz \
     pyobjc-framework-Cocoa 2>&1 | tail -5
 echo "[OK] Dependencies installed"
 
-# 下载语言包
+# 下载 argos 语言包（兜底翻译引擎）
 echo ""
-echo "[INFO] Downloading language packs (this may take a few minutes)..."
-python3 -c "
+echo "[INFO] Downloading argos language packs (this may take a few minutes)..."
+ARGOS_COUNT=$("$PYTHON_BIN" - <<'PYEOF'
 import argostranslate.package as pkg
+import sys
 
-pkg.update_package_index()
-available = pkg.get_available_packages()
+try:
+    pkg.update_package_index()
+    available = pkg.get_available_packages()
+except Exception as e:
+    print(f"  [ERROR] update_package_index failed: {e}", file=sys.stderr)
+    print(0)
+    sys.exit(0)
 
 pairs = [
     ('en','zh'), ('zh','en'),
@@ -68,36 +102,110 @@ pairs = [
     ('en','ar'), ('ar','en'),
 ]
 
-installed = 0
+# 已安装的跳过，避免重复下载。
+installed_pairs = {(p.from_code, p.to_code) for p in pkg.get_installed_packages()}
+ok = len(installed_pairs)
+
 for src, tgt in pairs:
+    if (src, tgt) in installed_pairs:
+        continue
+    matched = None
     for p in available:
         if p.from_code == src and p.to_code == tgt:
-            print(f'  Downloading {src} -> {tgt}...')
-            pkg.install_from_path(p.download())
-            installed += 1
+            matched = p
             break
+    if matched is None:
+        print(f"  [WARN] no package for {src} -> {tgt}", file=sys.stderr)
+        continue
+    try:
+        print(f"  Downloading {src} -> {tgt}...", file=sys.stderr)
+        pkg.install_from_path(matched.download())
+        ok += 1
+    except Exception as e:
+        print(f"  [WARN] download failed {src} -> {tgt}: {e}", file=sys.stderr)
 
-print(f'  Done. {installed} language packs installed.')
-"
-echo "[OK] Language packs ready"
+# 最后一行 stdout 是计数，给 shell 读
+print(ok)
+PYEOF
+)
+
+if [[ -z "$ARGOS_COUNT" || "$ARGOS_COUNT" -lt 1 ]]; then
+    echo "[ERROR] argos language packs failed to install (0 packs)."
+    echo "        网络/代理问题导致下载失败。请检查 https://www.argosopentech.com 可访问后重跑。"
+    exit 1
+fi
+echo "[OK] argos language packs ready ($ARGOS_COUNT pairs)"
+
+# ===== Swift 高质量翻译桥（macOS 15+，可选） =====
+if [[ "$(uname)" == "Darwin" ]]; then
+    SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+    MACOS_MAJOR=$(sw_vers -productVersion | cut -d. -f1)
+    echo ""
+    if [[ "$MACOS_MAJOR" -ge 15 ]]; then
+        if command -v swiftc &>/dev/null; then
+            echo "[INFO] Building Apple Translation bridge (swift translator-helper)..."
+            (
+                cd "$SCRIPT_DIR/swift"
+                if swiftc -O -parse-as-library -o translator-helper translator_helper.swift 2>&1; then
+                    echo "[OK] Built swift/translator-helper"
+                else
+                    echo "[WARN] translator-helper 编译失败，翻译会回退到 argos（速度/质量较低）"
+                fi
+                if swiftc -O -parse-as-library -o probe-prepare probe_prepare.swift 2>&1; then
+                    mkdir -p TranslatorPrepare.app/Contents/MacOS
+                    cp probe-prepare TranslatorPrepare.app/Contents/MacOS/TranslatorPrepare
+                    cat > TranslatorPrepare.app/Contents/Info.plist <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleExecutable</key><string>TranslatorPrepare</string>
+	<key>CFBundleIdentifier</key><string>com.local.translator.prepare</string>
+	<key>CFBundleName</key><string>TranslatorPrepare</string>
+	<key>CFBundleDisplayName</key><string>TranslatorPrepare</string>
+	<key>CFBundlePackageType</key><string>APPL</string>
+	<key>CFBundleShortVersionString</key><string>1.0</string>
+	<key>CFBundleVersion</key><string>1</string>
+	<key>LSMinimumSystemVersion</key><string>15.0</string>
+	<key>NSHighResolutionCapable</key><true/>
+</dict>
+</plist>
+PLIST
+                    echo "[OK] Built swift/TranslatorPrepare.app (Apple 语言包下载器)"
+                else
+                    echo "[WARN] TranslatorPrepare.app 编译失败，Apple 语言包需要手动通过系统设置下载"
+                fi
+            )
+        else
+            echo "[WARN] 未检测到 swiftc。Apple Translation framework 桥跳过编译。"
+            echo "       装 Xcode Command Line Tools 后重跑 install.sh 即可启用："
+            echo "         xcode-select --install"
+        fi
+    else
+        echo "[INFO] macOS $MACOS_MAJOR < 15，跳过 Apple Translation framework 桥（仅 argos 可用）"
+    fi
+fi
 
 # macOS: 创建 .app
 if [[ "$(uname)" == "Darwin" ]]; then
     echo ""
     echo "[INFO] Creating macOS apps..."
     SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-    SITE_PACKAGES=$(python3 -c "import site; print(site.getusersitepackages())")
+    SITE_PACKAGES=$("$PYTHON_BIN" -c "import site; print(site.getusersitepackages())")
+    PYTHON_BIN_Q=$(printf "%q" "$PYTHON_BIN")
+    SCRIPT_DIR_Q=$(printf "%q" "$SCRIPT_DIR")
+    SITE_PACKAGES_Q=$(printf "%q" "$SITE_PACKAGES")
 
     # 原有翻译器窗口应用
     APP_PATH="$SCRIPT_DIR/Local Translator.app"
     rm -rf "$APP_PATH"
-    osacompile -o "$APP_PATH" -e "do shell script \"export PYTHONPATH=$SITE_PACKAGES && /usr/bin/python3 $SCRIPT_DIR/app.py &> /tmp/translator.log &\""
+    osacompile -o "$APP_PATH" -e "do shell script \"export PYTHONPATH=$SITE_PACKAGES_Q && $PYTHON_BIN_Q $SCRIPT_DIR_Q/app.py &> /tmp/translator.log &\""
     echo "[OK] Created 'Local Translator.app'"
 
     # 选中即翻译后台服务
     DAEMON_PATH="$SCRIPT_DIR/Translate Daemon.app"
     rm -rf "$DAEMON_PATH"
-    osacompile -o "$DAEMON_PATH" -e "do shell script \"export PYTHONPATH=$SITE_PACKAGES && /usr/bin/python3 $SCRIPT_DIR/daemon.py &> /tmp/translator-daemon.log &\""
+    osacompile -o "$DAEMON_PATH" -e "do shell script \"export PYTHONPATH=$SITE_PACKAGES_Q && $PYTHON_BIN_Q $SCRIPT_DIR_Q/daemon.py &> /tmp/translator-daemon.log &\""
     echo "[OK] Created 'Translate Daemon.app'"
 fi
 
@@ -133,8 +241,10 @@ cat > "$WORKFLOW_PATH/Contents/Info.plist" << 'INFOEOF'
 </plist>
 INFOEOF
 
-SITE_PKG=$(python3 -c "import site; print(site.getusersitepackages())")
-TRANSLATE_CMD="export PYTHONPATH=$SITE_PKG\n/usr/bin/python3 $SCRIPT_DIR/translate_cli.py --dialog"
+SITE_PKG=$("$PYTHON_BIN" -c "import site; print(site.getusersitepackages())")
+PYTHON_BIN_Q=$(printf "%q" "$PYTHON_BIN")
+SCRIPT_DIR_Q=$(printf "%q" "$SCRIPT_DIR")
+SITE_PKG_Q=$(printf "%q" "$SITE_PKG")
 
 cat > "$WORKFLOW_PATH/Contents/document.wflow" << WFEOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -159,8 +269,8 @@ cat > "$WORKFLOW_PATH/Contents/document.wflow" << WFEOF
 				<key>ActionName</key><string>Run Shell Script</string>
 				<key>ActionParameters</key>
 				<dict>
-					<key>COMMAND_STRING</key><string>export PYTHONPATH=$SITE_PKG
-/usr/bin/python3 $SCRIPT_DIR/translate_cli.py --dialog</string>
+					<key>COMMAND_STRING</key><string>export PYTHONPATH=$SITE_PKG_Q
+$PYTHON_BIN_Q $SCRIPT_DIR_Q/translate_cli.py --dialog</string>
 					<key>CheckedForUserDefaultShell</key><true/>
 					<key>inputMethod</key><integer>0</integer>
 					<key>shell</key><string>/bin/bash</string>
@@ -225,8 +335,10 @@ echo "    1. Select any text"
 echo "    2. Right-click -> Services -> Translate"
 echo "    3. Dialog shows translation with Copy button"
 echo ""
-echo "  IMPORTANT: First launch requires Accessibility permission."
-echo "    System Settings -> Privacy & Security -> Accessibility"
+echo "  IMPORTANT: First launch requires permissions from the menu bar:"
+echo "    1. Translator menu -> ② 授权辅助功能（全局热键）"
+echo "    2. Translator menu -> ③ 授权输入监控（选中文字）"
+echo "    3. Translator menu -> ④ 授权屏幕录制（截图翻译）"
 echo ""
 
 # 让用户输入快捷键确认学会
@@ -245,17 +357,40 @@ while true; do
     fi
 done
 
+SCRIPT_DIR_FINAL="$(cd "$(dirname "$0")" && pwd)"
+
+# ===== Apple 语言包下载引导（macOS 15+） =====
+PREPARE_APP="$SCRIPT_DIR_FINAL/swift/TranslatorPrepare.app"
+if [[ "$(uname)" == "Darwin" ]] && [[ -x "$PREPARE_APP/Contents/MacOS/TranslatorPrepare" ]]; then
+    echo ""
+    echo "========================================="
+    echo "  Apple Translation 语言包（强烈推荐）"
+    echo "========================================="
+    echo ""
+    echo "  现在打开 TranslatorPrepare.app，会弹 4 个系统对话框（中/英/日/韩），"
+    echo "  每个点「下载」即可。装完翻译速度 5-8s → 60-120ms，质量也明显提升。"
+    echo ""
+    printf "  现在打开吗？[Y/n]: "
+    read prep_open
+    prep_open_lower=$(echo "${prep_open:-y}" | tr '[:upper:]' '[:lower:]' | tr -d ' ')
+    if [[ "$prep_open_lower" != "n" && "$prep_open_lower" != "no" ]]; then
+        open "$PREPARE_APP"
+        echo "  [OK] 已打开。装完 4 个语言包后关掉它即可。"
+    else
+        echo "  跳过。之后想装：双击 $PREPARE_APP"
+    fi
+fi
+
 echo ""
 echo "========================================="
 echo "  Installation complete!"
 echo "========================================="
 echo ""
 echo "  Usage:"
-SCRIPT_DIR_FINAL="$(cd "$(dirname "$0")" && pwd)"
-echo "    Translator window:   python3 $SCRIPT_DIR_FINAL/app.py"
-echo "    Select-to-translate:  python3 $SCRIPT_DIR_FINAL/daemon.py"
+echo "    Translator window:   $PYTHON_BIN $SCRIPT_DIR_FINAL/app.py"
+echo "    Select-to-translate:  $PYTHON_BIN $SCRIPT_DIR_FINAL/daemon.py"
 if [[ "$(uname)" == "Darwin" ]]; then
 echo "    macOS apps:  Double click 'Local Translator.app' or 'Translate Daemon.app'"
 fi
-echo "    Browser mode:  python3 $SCRIPT_DIR_FINAL/serve.py"
+echo "    Browser mode:  $PYTHON_BIN $SCRIPT_DIR_FINAL/serve.py"
 echo ""

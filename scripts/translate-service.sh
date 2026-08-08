@@ -10,6 +10,8 @@ set -euo pipefail
 # script works on any machine after `bash build_app.sh`); fall back to a path
 # relative to this script (dev tree).
 APP_RES="/Applications/Local Translator.app/Contents/Resources"
+APP_EXE="/Applications/Local Translator.app/Contents/MacOS/Local Translator"
+APP_DAEMON="$APP_RES/daemon.py"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 if [ -x "$APP_RES/swift/translator-helper" ]; then
     HELPER="$APP_RES/swift/translator-helper"
@@ -50,9 +52,23 @@ case "$src" in
     *)  tgt="zh" ;;
 esac
 
-# Try the Swift helper first.
+# Prefer the app's built-in service bridge.  It carries its own Python runtime
+# and argostranslate package, so Automator does not need a separately installed
+# "compatible Python".  It also honours the target language selected in the
+# menubar app and uses the Swift helper first internally.
 result=""
-if [ -x "$HELPER" ]; then
+# The source marker keeps this updated Service compatible with an older app
+# that does not understand --service-translate (calling an old executable with
+# that flag would otherwise launch another menu-bar instance and never return).
+if [ -x "$APP_EXE" ] && [ -f "$APP_DAEMON" ] \
+    && grep -q -- '--service-translate' "$APP_DAEMON"; then
+    result=$(printf '%s' "$text" | "$APP_EXE" --service-translate \
+        2>>/tmp/translator-service.log || true)
+fi
+
+# Legacy/dev fallback: try the Swift helper directly when the installed app
+# executable is unavailable.
+if [ -z "$result" ] && [ -x "$HELPER" ]; then
     json=$(printf '%s' "$text" | python3 -c "import json,sys; print(json.dumps({'text': sys.stdin.read(), 'src':'$src', 'tgt':'$tgt'}, ensure_ascii=False))")
     out=$(printf '%s\n' "$json" | "$HELPER" 2>/dev/null | head -1) || true
     if [ -n "$out" ]; then
@@ -60,20 +76,22 @@ if [ -x "$HELPER" ]; then
     fi
 fi
 
-# Argos fallback.
-if [ -z "$result" ] && [ -n "$PY" ]; then
+# Legacy/dev argos fallback.  Guard the script path explicitly because older
+# app bundles did not include translate_cli.py; that missing file caused the
+# misleading "Swift helper 未编译" error even when the helper existed.
+if [ -z "$result" ] && [ -n "$PY" ] && [ -f "$PROJECT/translate_cli.py" ]; then
     result=$("$PY" "$PROJECT/translate_cli.py" "$text" 2>/dev/null || true)
 fi
 
 if [ -z "$result" ]; then
-    result="[翻译失败：Swift helper 未编译且无 argos 兼容 Python]"
+    result="[翻译失败：应用翻译组件不可用。请打开 Local Translator，并从菜单栏运行“① 下载/检查语言包”后重试。]"
 fi
 
 # Show in a dialog with Copy button.
 printf '%s' "$result" > /tmp/translate_result.txt
 osascript <<EOF
 set resultText to do shell script "cat /tmp/translate_result.txt"
-set dialogResult to display dialog resultText with title "Translation ($src → $tgt)" buttons {"Close", "Copy"} default button "Copy"
+set dialogResult to display dialog resultText with title "Translation" buttons {"Close", "Copy"} default button "Copy"
 if button returned of dialogResult is "Copy" then
     set the clipboard to resultText
 end if
